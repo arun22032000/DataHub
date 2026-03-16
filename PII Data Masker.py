@@ -1,0 +1,669 @@
+import streamlit as st
+import pandas as pd
+import re
+import io
+import json
+import zipfile
+import requests
+import pyodbc
+from sqlalchemy import create_engine, inspect, text
+from snowflake.connector import connect
+
+st.set_page_config(page_title="PII Data Masker", layout="wide")
+st.title("🛡️ Database PII Shield")
+st.markdown("Connect to a data source, auto-detect PII columns with Ollama, review, then mask.")
+
+# ─── Regex patterns ───────────────────────────────────────────────────────────
+
+REGEX_PATTERNS = {
+    "EMAIL_ADDRESS": r'\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b',
+    "PHONE_NUMBER":  r'\b(\+?1[-.\s]?)?(\(?\d{3}\)?[-.\s]?)?\d{3}[-.\s]?\d{4}\b',
+    "US_SSN":        r'\b\d{3}-\d{2}-\d{4}\b',
+    "CREDIT_CARD":   r'\b(?:\d[ -]?){13,16}\b',
+    "IP_ADDRESS":    r'\b(?:\d{1,3}\.){3}\d{1,3}\b',
+}
+
+# ─── Masking ──────────────────────────────────────────────────────────────────
+
+def partial_mask(value: str) -> str:
+    s = str(value).strip()
+    n = len(s)
+    if n == 0:   return s
+    if n <= 4:   return "*" * n
+    if n <= 10:  return s[0] + "*" * (n - 2) + s[-1]
+    return s[:2] + "*" * (n - 4) + s[-2:]
+
+def mask_column(series: pd.Series) -> pd.Series:
+    return series.astype(str).apply(partial_mask)
+
+def mask_dataframe(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
+    masked = df.copy()
+    for col in cols:
+        if col in masked.columns:
+            masked[col] = mask_column(masked[col])
+    return masked
+
+# ─── Ollama ───────────────────────────────────────────────────────────────────
+
+def build_prompt(sample_json: str) -> str:
+    return f"""You are a PII detection engine. Below is a JSON object where each key is a column name and the value is a list of sample values from that column.
+
+Identify which columns contain Personally Identifiable Information (PII) such as: names, emails, phone numbers, addresses, SSNs, credit card numbers, dates of birth, IP addresses, usernames, or any other sensitive personal data.
+
+Rules:
+- Return ONLY a JSON array of column names that contain PII.
+- If no PII columns exist, return [].
+- Be conservative: only flag columns with clear PII.
+- Do NOT include explanations or markdown fences.
+
+Column samples:
+{sample_json}
+
+Response (JSON array only):"""
+
+def _call_ollama_batch(columns_sample: dict, base_url: str, model: str, timeout: int, retries: int = 2) -> list[str]:
+    prompt = build_prompt(json.dumps(columns_sample, indent=2))
+    last_err = None
+    for attempt in range(1, retries + 2):
+        try:
+            resp = requests.post(
+                f"{base_url.rstrip('/')}/api/chat",
+                json={
+                    "model": model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "stream": False,
+                    "options": {"temperature": 0, "num_predict": 256},
+                },
+                timeout=timeout,
+            )
+            resp.raise_for_status()
+            raw = resp.json()["message"]["content"].strip()
+            raw = re.sub(r"^```(?:json)?|```$", "", raw, flags=re.MULTILINE).strip()
+            result = json.loads(raw)
+            if isinstance(result, list):
+                return [c for c in result if c in columns_sample]
+            return []
+        except requests.exceptions.Timeout as e:
+            last_err = e
+            if attempt <= retries:
+                st.toast(f"Ollama timeout on attempt {attempt}/{retries+1}, retrying...")
+                continue
+        except json.JSONDecodeError as e:
+            last_err = e
+            break
+        except Exception as e:
+            last_err = e
+            break
+    raise last_err or RuntimeError("Ollama batch failed after retries")
+
+def ollama_detect_pii_columns(df: pd.DataFrame, base_url: str, model: str,
+                               timeout: int = 180, batch_size: int = 10) -> list[str]:
+    all_cols = list(df.columns)
+    pii_cols = []
+    batches  = [all_cols[i:i + batch_size] for i in range(0, len(all_cols), batch_size)]
+    for idx, batch_cols in enumerate(batches, start=1):
+        samples = {col: df[col].dropna().astype(str).head(3).tolist() for col in batch_cols}
+        try:
+            pii_cols.extend(_call_ollama_batch(samples, base_url, model, timeout))
+        except Exception as e:
+            st.warning(f"  Batch {idx}/{len(batches)} failed: {e}. Skipping.")
+    return list(dict.fromkeys(pii_cols))
+
+def cortex_detect_pii_columns(df: pd.DataFrame, conn, model: str, batch_size: int = 10) -> list[str]:
+    """
+    Detect PII columns using Snowflake Cortex AI (COMPLETE function).
+    Sends column samples directly to Cortex via the active Snowflake connection.
+    """
+    all_cols = list(df.columns)
+    pii_cols = []
+    batches  = [all_cols[i:i + batch_size] for i in range(0, len(all_cols), batch_size)]
+    cur = conn.cursor()
+
+    for idx, batch_cols in enumerate(batches, start=1):
+        samples = {col: df[col].dropna().astype(str).head(3).tolist() for col in batch_cols}
+        prompt  = build_prompt(json.dumps(samples, indent=2)).replace("'", "\'")
+        try:
+            cur.execute(f"SELECT SNOWFLAKE.CORTEX.COMPLETE('{model}', '{prompt}')")
+            row = cur.fetchone()
+            raw = (row[0] if row else "").strip()
+            raw = re.sub(r"^```(?:json)?|```$", "", raw, flags=re.MULTILINE).strip()
+            result = json.loads(raw)
+            if isinstance(result, list):
+                pii_cols.extend([c for c in result if c in samples])
+        except json.JSONDecodeError as e:
+            st.warning(f"  Cortex batch {idx}/{len(batches)} returned unparseable JSON: {e}. Skipping.")
+        except Exception as e:
+            st.warning(f"  Cortex batch {idx}/{len(batches)} failed: {e}. Skipping.")
+
+    return list(dict.fromkeys(pii_cols))
+
+
+def regex_detect_pii_columns(df: pd.DataFrame) -> list[str]:
+    hits = []
+    for col in df.columns:
+        series = df[col].astype(str)
+        for pattern in REGEX_PATTERNS.values():
+            if series.str.contains(pattern, regex=True, na=False).any():
+                hits.append(col)
+                break
+    return hits
+
+# ─── Data sources ─────────────────────────────────────────────────────────────
+
+@st.cache_resource
+def get_snowflake_conn(account, user, password, warehouse, database, schema, role):
+    return connect(account=account, user=user, password=password,
+                   warehouse=warehouse, database=database, schema=schema,
+                   role=role or None)
+
+def snowflake_fetch_tables(conn, database, schema):
+    cur = conn.cursor()
+    cur.execute(f"SHOW TABLES IN {database}.{schema}")
+    return [r[1] for r in cur.fetchall()]
+
+def snowflake_fetch_data(conn, database, schema, table, limit):
+    cur = conn.cursor()
+    cur.execute(f'SELECT * FROM "{database}"."{schema}"."{table}" LIMIT {limit}')
+    return cur.fetch_pandas_all()
+
+def snowflake_create_clone_schema(conn, src_db, src_schema, tgt_db, tgt_schema,
+                                   table_masked_map: dict):
+    """Create target schema and write masked tables into Snowflake."""
+    cur = conn.cursor()
+    cur.execute(f'CREATE DATABASE IF NOT EXISTS "{tgt_db}"')
+    cur.execute(f'CREATE SCHEMA IF NOT EXISTS "{tgt_db}"."{tgt_schema}"')
+    from snowflake.connector.pandas_tools import write_pandas
+    results = {}
+    for table_name, masked_df in table_masked_map.items():
+        try:
+            success, _, nrows, _ = write_pandas(
+                conn, masked_df,
+                table_name=table_name.upper(),
+                database=tgt_db,
+                schema=tgt_schema,
+                auto_create_table=True,
+                overwrite=True,
+            )
+            results[table_name] = f"✅ {nrows} rows written"
+        except Exception as e:
+            results[table_name] = f"❌ {e}"
+    return results
+
+@st.cache_resource
+def get_sqlserver_engine(server, database, username, password, driver):
+    if username and password:
+        conn_str = (f"mssql+pyodbc://{username}:{password}@{server}/{database}"
+                    f"?driver={driver.replace(' ', '+')}")
+    else:
+        conn_str = (f"mssql+pyodbc://@{server}/{database}"
+                    f"?driver={driver.replace(' ', '+')}&trusted_connection=yes")
+    return create_engine(conn_str)
+
+def sqlserver_fetch_tables(engine):
+    return inspect(engine).get_table_names()
+
+def sqlserver_fetch_data(engine, table, limit):
+    return pd.read_sql(f"SELECT TOP {limit} * FROM [{table}]", engine)
+
+def sqlserver_create_clone_db(engine, tgt_db: str, table_masked_map: dict):
+    """Create a new SQL Server database and write masked tables into it."""
+    results = {}
+    with engine.connect() as con:
+        con.execute(text("COMMIT"))
+        try:
+            con.execute(text(f"IF DB_ID('{tgt_db}') IS NULL CREATE DATABASE [{tgt_db}]"))
+        except Exception as e:
+            return {t: f"❌ Could not create DB: {e}" for t in table_masked_map}
+
+    tgt_url = str(engine.url).rsplit("/", 1)[0] + f"/{tgt_db}"
+    tgt_engine = create_engine(tgt_url)
+    for table_name, masked_df in table_masked_map.items():
+        try:
+            masked_df.to_sql(table_name, tgt_engine, if_exists="replace", index=False)
+            results[table_name] = f"✅ {len(masked_df)} rows written"
+        except Exception as e:
+            results[table_name] = f"❌ {e}"
+    return results
+
+# ─── Sidebar ──────────────────────────────────────────────────────────────────
+
+with st.sidebar:
+    st.header("1. Data Source")
+    source_type = st.radio("Select data source",
+                           ["Snowflake", "SQL Server", "CSV Upload"])
+    st.divider()
+
+    if source_type == "Snowflake":
+        st.subheader("Snowflake Connection")
+        sf_account   = st.text_input("Account identifier", placeholder="xy12345.us-east-1")
+        sf_user      = st.text_input("Username")
+        sf_password  = st.text_input("Password", type="password")
+        sf_warehouse = st.text_input("Warehouse", placeholder="COMPUTE_WH")
+        sf_database  = st.text_input("Database")
+        sf_schema    = st.text_input("Schema", value="PUBLIC")
+        sf_role      = st.text_input("Role (optional)")
+
+    elif source_type == "SQL Server":
+        st.subheader("SQL Server Connection")
+        sql_server   = st.text_input("Server", placeholder="localhost\\SQLEXPRESS")
+        sql_database = st.text_input("Database")
+        sql_username = st.text_input("Username (blank = Windows auth)")
+        sql_password = st.text_input("Password", type="password")
+        available_drivers = [d for d in pyodbc.drivers() if "SQL Server" in d] or ["ODBC Driver 17 for SQL Server"]
+        sql_driver   = st.selectbox("ODBC Driver", available_drivers)
+
+    elif source_type == "CSV Upload":
+        st.subheader("CSV Upload")
+        uploaded_file = st.file_uploader("Upload CSV file(s)", type=["csv"], accept_multiple_files=True)
+        csv_separator = st.selectbox("Delimiter", [",", ";", "\t", "|"])
+        csv_encoding  = st.selectbox("Encoding", ["utf-8", "latin-1", "utf-16"])
+
+    st.divider()
+    st.subheader("2. AI Detection Engine")
+
+    ai_engine = st.radio(
+        "Select AI engine",
+        ["Ollama (LLaMA)", "Snowflake Cortex"],
+        horizontal=True,
+        help="Ollama runs locally. Snowflake Cortex can be used with any data source.",
+    )
+
+    if ai_engine == "Ollama (LLaMA)":
+        ollama_url     = st.text_input("Ollama base URL", value="http://localhost:11434")
+        ollama_model   = st.text_input("Model", value="llama3")
+        ollama_timeout = st.number_input("Timeout (s)", min_value=30, max_value=600, value=180, step=30)
+        ollama_batch   = st.number_input("Columns per batch", min_value=1, max_value=30, value=10)
+        cortex_model   = None
+        cortex_account = cortex_user = cortex_password = cortex_warehouse = None
+    else:
+        cortex_model = st.selectbox(
+            "Cortex model",
+            ["mistral-large2", "llama3.1-70b", "llama3.1-8b", "snowflake-arctic", "mixtral-8x7b"],
+            help="Must be available in your Snowflake account & region.",
+        )
+        ollama_batch = st.number_input("Columns per batch", min_value=1, max_value=30, value=10)
+        ollama_url = ollama_model = None
+        ollama_timeout = 180
+
+        # If data source is already Snowflake, reuse that connection — no extra fields needed
+        if source_type == "Snowflake":
+            st.info("✅ Cortex will use your Snowflake data source connection.")
+            cortex_account = cortex_user = cortex_password = cortex_warehouse = None
+        else:
+            st.info("Enter Snowflake credentials below to connect Cortex for AI detection.")
+            cortex_account   = st.text_input("Cortex: Account identifier", placeholder="xy12345.us-east-1", key="cx_account")
+            cortex_user      = st.text_input("Cortex: Username", key="cx_user")
+            cortex_password  = st.text_input("Cortex: Password", type="password", key="cx_password")
+            cortex_warehouse = st.text_input("Cortex: Warehouse", placeholder="COMPUTE_WH", key="cx_warehouse")
+
+    st.divider()
+    st.subheader("3. Fetch Settings")
+    row_limit = st.number_input("Row limit per table", min_value=1, max_value=100_000, value=500)
+
+    connect_btn = st.button(
+        "Connect" if source_type != "CSV Upload" else "Load Files",
+        use_container_width=True, type="primary"
+    )
+
+# ─── Session state ────────────────────────────────────────────────────────────
+
+defaults = {
+    "connection": None, "source_type": None, "tables": [],
+    "selected_tables": [], "table_dfs": {},
+    "table_pii_cols": {},   # {table: [detected pii cols]}
+    "table_final_cols": {}, # {table: [user-confirmed cols]}
+    "table_masked_dfs": {}, # {table: masked df}
+    "detection_done": False,
+}
+for k, v in defaults.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
+
+# Reset when source type switches
+if st.session_state.source_type != source_type:
+    for k, v in defaults.items():
+        st.session_state[k] = v
+    st.session_state.source_type = source_type
+
+# ─── Step 1: Connect ──────────────────────────────────────────────────────────
+
+if connect_btn:
+    for k in ("tables", "selected_tables", "table_dfs", "table_pii_cols",
+              "table_final_cols", "table_masked_dfs", "detection_done"):
+        st.session_state[k] = [] if k in ("tables", "selected_tables") else ({} if k not in ("detection_done",) else False)
+
+    if source_type == "Snowflake":
+        with st.spinner("Connecting to Snowflake..."):
+            try:
+                conn = get_snowflake_conn(sf_account, sf_user, sf_password,
+                                          sf_warehouse, sf_database, sf_schema, sf_role)
+                st.session_state.connection = ("snowflake", conn, sf_database, sf_schema)
+                st.session_state.tables     = snowflake_fetch_tables(conn, sf_database, sf_schema)
+                st.success(f"Connected! Found {len(st.session_state.tables)} tables.")
+            except Exception as e:
+                st.error(f"Snowflake connection failed: {e}")
+
+    elif source_type == "SQL Server":
+        with st.spinner("Connecting to SQL Server..."):
+            try:
+                engine = get_sqlserver_engine(sql_server, sql_database, sql_username, sql_password, sql_driver)
+                with engine.connect(): pass
+                st.session_state.connection = ("sqlserver", engine)
+                st.session_state.tables     = sqlserver_fetch_tables(engine)
+                st.success(f"Connected! Found {len(st.session_state.tables)} tables.")
+            except Exception as e:
+                st.error(f"SQL Server connection failed: {e}")
+
+    elif source_type == "CSV Upload":
+        if not uploaded_file:
+            st.error("Please upload at least one CSV file.")
+        else:
+            loaded = {}
+            for f in uploaded_file:
+                try:
+                    loaded[f.name] = pd.read_csv(f, sep=csv_separator, encoding=csv_encoding)
+                except Exception as e:
+                    st.error(f"Failed to read {f.name}: {e}")
+            if loaded:
+                st.session_state.connection = ("csv", None)
+                st.session_state.tables     = list(loaded.keys())
+                st.session_state.table_dfs  = loaded
+                st.success(f"Loaded {len(loaded)} file(s): {', '.join(loaded.keys())}")
+
+# ─── Step 2: Table Selection ──────────────────────────────────────────────────
+
+if st.session_state.connection and st.session_state.tables:
+    st.divider()
+    st.header("Step 2 — Select Tables")
+
+    tables = st.session_state.tables
+
+    # Select All / Deselect All buttons
+    col_a, col_b, col_c = st.columns([1.2, 1.5, 7])
+    with col_a:
+        if st.button("☑ Select All", use_container_width=True):
+            st.session_state.selected_tables = list(tables)
+            for tbl in tables:
+                st.session_state[f"chk_{tbl}"] = True
+            st.rerun()
+    with col_b:
+        if st.button("☐ Deselect All", use_container_width=True):
+            st.session_state.selected_tables = []
+            for tbl in tables:
+                st.session_state[f"chk_{tbl}"] = False
+            st.rerun()
+
+    # Build per-table checkboxes in a grid (4 columns)
+    checked = {}
+    cols_grid = st.columns(4)
+    for i, tbl in enumerate(tables):
+        with cols_grid[i % 4]:
+            checked[tbl] = st.checkbox(tbl, key=f"chk_{tbl}")
+
+    st.session_state.selected_tables = [t for t, v in checked.items() if v]
+
+    if st.session_state.selected_tables:
+        st.caption(f"{len(st.session_state.selected_tables)} table(s) selected: "
+                   f"`{'`, `'.join(st.session_state.selected_tables)}`")
+
+    fetch_detect_btn = st.button(
+        f"🔍 Fetch & Detect PII — {len(st.session_state.selected_tables)} table(s)",
+        type="primary",
+        disabled=not st.session_state.selected_tables,
+    )
+
+    # ── Fetch & Detect ────────────────────────────────────────────────────────
+    if fetch_detect_btn:
+        # Preserve pre-loaded CSV data before clearing state
+        _saved_csv_dfs = {
+            k: v for k, v in st.session_state.table_dfs.items()
+        } if st.session_state.connection and st.session_state.connection[0] == "csv" else {}
+
+        st.session_state.table_dfs        = _saved_csv_dfs  # restore CSV data, empty for DB sources
+        st.session_state.table_pii_cols   = {}
+        st.session_state.table_final_cols = {}
+        st.session_state.table_masked_dfs = {}
+        st.session_state.detection_done   = False
+
+        conn_type = st.session_state.connection[0]
+        total_tables = len(st.session_state.selected_tables)
+
+        overall_bar = st.progress(0, text="Starting...")
+        for t_idx, table in enumerate(st.session_state.selected_tables):
+            overall_bar.progress(t_idx / total_tables, text=f"Processing `{table}` ({t_idx+1}/{total_tables})...")
+
+            # Fetch
+            with st.spinner(f"Fetching `{table}`..."):
+                try:
+                    if conn_type == "snowflake":
+                        _, conn, db, sch = st.session_state.connection
+                        df = snowflake_fetch_data(conn, db, sch, table, int(row_limit))
+                    elif conn_type == "sqlserver":
+                        _, engine = st.session_state.connection
+                        df = sqlserver_fetch_data(engine, table, int(row_limit))
+                    elif conn_type == "csv":
+                        df = st.session_state.table_dfs.get(table, pd.DataFrame())
+                    st.session_state.table_dfs[table] = df
+                except Exception as e:
+                    st.error(f"Failed to fetch `{table}`: {e}")
+                    continue
+
+            # Regex pre-screen
+            regex_cols = regex_detect_pii_columns(df)
+
+            # AI detection (Ollama or Cortex)
+            if ai_engine == "Ollama (LLaMA)":
+                with st.spinner(f"Asking Ollama ({ollama_model}) about `{table}`..."):
+                    try:
+                        llm_cols = ollama_detect_pii_columns(
+                            df, ollama_url, ollama_model,
+                            timeout=int(ollama_timeout), batch_size=int(ollama_batch)
+                        )
+                    except Exception as e:
+                        st.warning(f"Ollama failed for `{table}`: {e}. Using regex only.")
+                        llm_cols = []
+            else:
+                # Resolve Snowflake connection for Cortex:
+                # - If data source is Snowflake, reuse that connection
+                # - Otherwise use the separately entered Cortex credentials
+                if st.session_state.connection and st.session_state.connection[0] == "snowflake":
+                    sf_conn_for_cortex = st.session_state.connection[1]
+                elif cortex_account and cortex_user and cortex_password:
+                    try:
+                        sf_conn_for_cortex = st.session_state.get("cortex_conn") or connect(
+                            account=cortex_account, user=cortex_user,
+                            password=cortex_password, warehouse=cortex_warehouse or "",
+                        )
+                        st.session_state["cortex_conn"] = sf_conn_for_cortex
+                    except Exception as e:
+                        st.warning(f"Could not connect to Snowflake for Cortex: {e}. Falling back to regex only.")
+                        sf_conn_for_cortex = None
+                else:
+                    st.warning("Snowflake Cortex credentials are incomplete. Falling back to regex only.")
+                    sf_conn_for_cortex = None
+
+                if sf_conn_for_cortex is None:
+                    llm_cols = []
+                else:
+                    with st.spinner(f"Asking Snowflake Cortex ({cortex_model}) about `{table}`..."):
+                        try:
+                            llm_cols = cortex_detect_pii_columns(
+                                df, sf_conn_for_cortex, cortex_model, batch_size=int(ollama_batch)
+                            )
+                        except Exception as e:
+                            st.warning(f"Cortex failed for `{table}`: {e}. Using regex only.")
+                            llm_cols = []
+
+            combined = list(dict.fromkeys(llm_cols + regex_cols))
+            st.session_state.table_pii_cols[table]   = combined
+            st.session_state.table_final_cols[table] = combined  # editable copy
+            # Pre-populate the multiselect widget key so default= is honoured on all reruns
+            st.session_state[f"final_{table}"] = [c for c in combined if c in df.columns]
+
+        overall_bar.progress(1.0, text="Detection complete!")
+        st.session_state.detection_done = True
+        st.rerun()
+
+# ─── Step 3: Review PII per Table ─────────────────────────────────────────────
+
+if st.session_state.detection_done and st.session_state.table_pii_cols:
+    st.divider()
+    st.header("Step 3 — Review & Finalize PII Columns")
+    st.markdown(
+        "Ollama has pre-selected the PII columns per table. "
+        "**Add or remove** columns for each table as needed."
+    )
+
+    for table in st.session_state.selected_tables:
+        df      = st.session_state.table_dfs.get(table, pd.DataFrame())
+        detected = st.session_state.table_pii_cols.get(table, [])
+
+        with st.expander(
+            f"📋 **{table}** — {len(detected)} PII column(s) detected  "
+            f"| {len(df):,} rows × {len(df.columns)} cols",
+            expanded=True,
+        ):
+            # Widget key drives pre-selection (set during detection); read back after user edits
+            final_cols = st.multiselect(
+                "PII columns to mask",
+                options=list(df.columns),
+                key=f"final_{table}",
+                help="Pre-populated by AI + regex. Add or remove freely.",
+            )
+            st.session_state.table_final_cols[table] = final_cols
+
+            # Preview toggle (inline, compatible with all Streamlit versions)
+            if final_cols:
+                if st.button(f"👁️ Preview Masking", key=f"prev_btn_{table}"):
+                    st.session_state[f"show_preview_{table}"] = not st.session_state.get(f"show_preview_{table}", False)
+
+                if st.session_state.get(f"show_preview_{table}", False):
+                    with st.container(border=True):
+                        st.markdown(f"**Masking Preview — `{table}`** *(first 10 rows of selected PII columns)*")
+                        orig   = df[final_cols].head(10)
+                        masked = orig.apply(mask_column)
+                        t1, t2 = st.tabs(["Masked", "Original"])
+                        with t1: st.dataframe(masked, use_container_width=True)
+                        with t2: st.dataframe(orig, use_container_width=True)
+
+
+    # ── Apply masking button ──────────────────────────────────────────────────
+    st.divider()
+    any_cols = any(cols for cols in st.session_state.table_final_cols.values())
+    if st.button("🔒 Apply Masking to All Tables", type="primary", disabled=not any_cols):
+        masked_map = {}
+        for table in st.session_state.selected_tables:
+            df   = st.session_state.table_dfs.get(table, pd.DataFrame())
+            cols = st.session_state.table_final_cols.get(table, [])
+            masked_map[table] = mask_dataframe(df, cols)
+        st.session_state.table_masked_dfs = masked_map
+        st.success("✅ Masking applied to all tables!")
+        st.rerun()
+
+# ─── Step 4: Download / Clone ─────────────────────────────────────────────────
+
+if st.session_state.table_masked_dfs:
+    st.divider()
+    st.header("Step 4 — Export Masked Data")
+
+    conn_type = st.session_state.connection[0] if st.session_state.connection else "csv"
+
+    tab_csv, tab_clone = st.tabs(["📥 Download CSVs", "🗄️ Clone to Database"])
+
+    # ── CSV download tab ──────────────────────────────────────────────────────
+    with tab_csv:
+        st.markdown("Download individual CSVs or a single ZIP containing all tables.")
+
+        # Individual downloads
+        st.subheader("Individual tables")
+        dl_cols = st.columns(min(len(st.session_state.table_masked_dfs), 4))
+        for i, (table, mdf) in enumerate(st.session_state.table_masked_dfs.items()):
+            buf = io.BytesIO()
+            mdf.to_csv(buf, index=False)
+            with dl_cols[i % 4]:
+                st.download_button(
+                    label=f"⬇️ {table}.csv",
+                    data=buf.getvalue(),
+                    file_name=f"masked_{table}.csv",
+                    mime="text/csv",
+                    key=f"dl_{table}",
+                )
+
+        # ZIP download
+        st.subheader("All tables as ZIP")
+        zip_buf = io.BytesIO()
+        with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            for table, mdf in st.session_state.table_masked_dfs.items():
+                csv_bytes = mdf.to_csv(index=False).encode("utf-8")
+                zf.writestr(f"masked_{table}.csv", csv_bytes)
+        st.download_button(
+            label="⬇️ Download All as ZIP",
+            data=zip_buf.getvalue(),
+            file_name="masked_tables.zip",
+            mime="application/zip",
+        )
+
+    # ── Clone to DB tab ───────────────────────────────────────────────────────
+    with tab_clone:
+        if conn_type == "csv":
+            st.info("Clone to database is not available for CSV uploads. Use the CSV download tab.")
+        else:
+            st.markdown(
+                "Write all masked tables into a **new database/schema** on the same server, "
+                "leaving the original data untouched."
+            )
+            if conn_type == "snowflake":
+                _, conn, src_db, src_schema = st.session_state.connection
+                c1, c2 = st.columns(2)
+                with c1: tgt_db     = st.text_input("Target Database", value=f"{src_db}_MASKED")
+                with c2: tgt_schema = st.text_input("Target Schema",   value=src_schema)
+
+                if st.button("🚀 Create Clone & Write Masked Data", type="primary"):
+                    with st.spinner("Writing masked tables to Snowflake..."):
+                        results = snowflake_create_clone_schema(
+                            conn, src_db, src_schema, tgt_db, tgt_schema,
+                            st.session_state.table_masked_dfs
+                        )
+                    for tbl, msg in results.items():
+                        st.write(f"**{tbl}**: {msg}")
+
+            elif conn_type == "sqlserver":
+                _, engine = st.session_state.connection
+                src_db  = str(engine.url).rsplit("/", 1)[-1]
+                tgt_db  = st.text_input("Target Database", value=f"{src_db}_Masked")
+
+                if st.button("🚀 Create Clone DB & Write Masked Data", type="primary"):
+                    with st.spinner("Writing masked tables to SQL Server..."):
+                        results = sqlserver_create_clone_db(
+                            engine, tgt_db,
+                            st.session_state.table_masked_dfs
+                        )
+                    for tbl, msg in results.items():
+                        st.write(f"**{tbl}**: {msg}")
+
+elif st.session_state.connection is None:
+    st.info("👈 Select a data source in the sidebar and click Connect to begin.")
+
+# ─── Setup instructions ───────────────────────────────────────────────────────
+
+#with st.expander("ℹ️ Setup & prerequisites"):
+#    st.markdown("""
+#**Install packages:**
+#```bash
+#pip install streamlit pandas snowflake-connector-python requests pyodbc sqlalchemy
+#```
+#
+#**Ollama setup:**
+#```bash
+#ollama pull llama3
+#ollama serve   # runs on http://localhost:11434
+#```
+#
+#**Masking rules:**
+#
+#| Value length | Example | Masked |
+#|---|---|---|
+#| ≤ 4 chars | `John` | `****` |
+#| 5–10 chars | `john@x.co` | `j*******o` |
+#| > 10 chars | `john@email.com` | `jo**********om` |
+#""")
