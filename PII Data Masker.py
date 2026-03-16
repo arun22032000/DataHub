@@ -478,9 +478,12 @@ defaults = {
     "table_final_cols": {}, # {table: [user-confirmed cols]}
     "table_masked_dfs": {}, # {table: masked df}
     "detection_done": False,
-    "faker_maps": {},        # {table: {col: faker_fn}}
+    "faker_maps": {},         # {table: {col: faker_fn}}
     "faker_mapped": False,
-    "faker_dfs": {},         # {table: generated fake df}
+    "faker_dfs": {},          # {table: generated fake df}
+    "faker_mode": "replace",  # "replace" or "append"
+    "fake_row_overrides": {}, # {table: int}  per-table row counts
+    "active_output": None,    # "masked" or "fake" — drives Step 4
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -573,11 +576,20 @@ if st.session_state.connection and st.session_state.tables:
         st.caption(f"{len(st.session_state.selected_tables)} table(s) selected: "
                    f"`{'`, `'.join(st.session_state.selected_tables)}`")
 
-    fetch_detect_btn = st.button(
-        f"🔍 Fetch & Detect PII — {len(st.session_state.selected_tables)} table(s)",
-        type="primary",
-        disabled=not st.session_state.selected_tables,
-    )
+    btn_col1, btn_col2 = st.columns([2, 2])
+    with btn_col1:
+        fetch_detect_btn = st.button(
+            f"🔍 Fetch & Detect PII — {len(st.session_state.selected_tables)} table(s)",
+            type="primary",
+            disabled=not st.session_state.selected_tables,
+            use_container_width=True,
+        )
+    with btn_col2:
+        fetch_fake_btn = st.button(
+            f"🎭 Fetch & Generate Fake Data — {len(st.session_state.selected_tables)} table(s)",
+            disabled=not st.session_state.selected_tables,
+            use_container_width=True,
+        )
 
     # ── Fetch & Detect ────────────────────────────────────────────────────────
     if fetch_detect_btn:
@@ -669,6 +681,72 @@ if st.session_state.connection and st.session_state.tables:
 
         overall_bar.progress(1.0, text="Detection complete!")
         st.session_state.detection_done = True
+        st.session_state.active_output  = "masked"
+        st.rerun()
+
+    # ── Fetch & Generate Fake Data ────────────────────────────────────────────
+    if fetch_fake_btn:
+        # Preserve pre-loaded CSV data
+        _saved_csv_dfs2 = {
+            k: v for k, v in st.session_state.table_dfs.items()
+        } if st.session_state.connection and st.session_state.connection[0] == "csv" else {}
+
+        st.session_state.table_dfs        = _saved_csv_dfs2
+        st.session_state.faker_maps       = {}
+        st.session_state.faker_mapped     = False
+        st.session_state.faker_dfs        = {}
+        st.session_state.fake_row_overrides = {}
+        st.session_state.table_masked_dfs = {}
+        st.session_state.detection_done   = False
+
+        conn_type2 = st.session_state.connection[0]
+
+        # Resolve AI for faker column mapping
+        if ai_engine == "Ollama (LLaMA)":
+            _fai_engine2, _fai_sf_conn2 = "Ollama (LLaMA)", None
+        else:
+            _fai_engine2 = "Snowflake Cortex"
+            if st.session_state.connection and st.session_state.connection[0] == "snowflake":
+                _fai_sf_conn2 = st.session_state.connection[1]
+            elif st.session_state.get("cortex_conn"):
+                _fai_sf_conn2 = st.session_state["cortex_conn"]
+            else:
+                _fai_sf_conn2 = None
+
+        fake_bar = st.progress(0, text="Starting...")
+        for t_idx, table in enumerate(st.session_state.selected_tables):
+            fake_bar.progress(t_idx / len(st.session_state.selected_tables),
+                              text=f"Fetching & mapping `{table}` ({t_idx+1}/{len(st.session_state.selected_tables)})...")
+            # Fetch
+            try:
+                if conn_type2 == "snowflake":
+                    _, conn2, db2, sch2 = st.session_state.connection
+                    df2 = snowflake_fetch_data(conn2, db2, sch2, table, int(row_limit))
+                elif conn_type2 == "sqlserver":
+                    _, engine2 = st.session_state.connection
+                    df2 = sqlserver_fetch_data(engine2, table, int(row_limit))
+                elif conn_type2 == "csv":
+                    df2 = st.session_state.table_dfs.get(table, pd.DataFrame())
+                st.session_state.table_dfs[table] = df2
+            except Exception as e:
+                st.error(f"Failed to fetch `{table}`: {e}")
+                continue
+
+            # Default row count = actual table row count
+            st.session_state.fake_row_overrides[table] = len(df2)
+
+            # AI column mapping
+            fmap = ai_map_faker_columns(
+                list(df2.columns), _fai_engine2,
+                ollama_url=ollama_url, ollama_model=ollama_model,
+                ollama_timeout=int(ollama_timeout),
+                sf_conn=_fai_sf_conn2, cortex_model=cortex_model,
+            )
+            st.session_state.faker_maps[table] = fmap
+
+        fake_bar.progress(1.0, text="Mapping complete!")
+        st.session_state.faker_mapped     = True
+        st.session_state.active_output    = "fake"
         st.rerun()
 
 # ─── Step 3: Review PII per Table ─────────────────────────────────────────────
@@ -723,285 +801,189 @@ if st.session_state.detection_done and st.session_state.table_pii_cols:
             cols = st.session_state.table_final_cols.get(table, [])
             masked_map[table] = mask_dataframe(df, cols)
         st.session_state.table_masked_dfs = masked_map
+        st.session_state.active_output    = "masked"
         st.success("✅ Masking applied to all tables!")
         st.rerun()
 
-# ─── Step 4: Download / Clone / Fake Data ────────────────────────────────────
+# ─── Step 3b: Fake Data Review & Generate ─────────────────────────────────────
 
-if st.session_state.table_masked_dfs:
+if st.session_state.faker_mapped and st.session_state.faker_maps:
     st.divider()
-    st.header("Step 4 — Export Masked Data")
+    st.header("Step 3 — Review & Generate Fake Data")
+    st.markdown(
+        "AI has mapped each column to a Faker method. "
+        "**Edit mappings** and set **row counts per table**, then click Generate."
+    )
 
+    # ── Global mode ──────────────────────────────────────────────────────────
+    g1, g2 = st.columns([3, 2])
+    with g1:
+        fake_mode = st.radio(
+            "Generation mode",
+            ["Replace all data with fake data", "Append fake rows to existing data"],
+            key="fake_mode_radio",
+            horizontal=True,
+            help="Replace: discard originals entirely. Append: add fake rows below original data.",
+        )
+    with g2:
+        st.caption("Per-table row counts are set inside each table expander below.")
+
+    FAKER_OPTIONS = sorted([
+        "name","first_name","last_name","email","phone_number","ssn",
+        "address","street_address","city","state","zipcode","postcode",
+        "country","company","user_name","password","ipv4","ipv6","url",
+        "date_of_birth","date","credit_card_number","iban","bban",
+        "text","sentence","word","uuid4","job","latitude","longitude",
+        "random_int","pyfloat","random_element",
+    ])
+
+    updated_maps = {}
+    for table in st.session_state.selected_tables:
+        fmap = st.session_state.faker_maps.get(table, {})
+        if not fmap:
+            continue
+        df_t          = st.session_state.table_dfs.get(table, pd.DataFrame())
+        default_rows  = st.session_state.fake_row_overrides.get(table, len(df_t))
+
+        with st.expander(
+            f"📋 **{table}** — {len(fmap)} columns | original {len(df_t):,} rows",
+            expanded=True,
+        ):
+            # Per-table row count control
+            rc_col, _ = st.columns([2, 4])
+            with rc_col:
+                tbl_rows = st.number_input(
+                    "Rows to generate",
+                    min_value=1, max_value=1_000_000,
+                    value=int(default_rows),
+                    key=f"rows_{table}",
+                    help=f"Default = original row count ({len(df_t):,})",
+                )
+            st.session_state.fake_row_overrides[table] = int(tbl_rows)
+
+            # Column → Faker mapping grid (3 columns)
+            updated_maps[table] = {}
+            cols_list = list(fmap.keys())
+            grid = st.columns(3)
+            for ci, col in enumerate(cols_list):
+                with grid[ci % 3]:
+                    current = fmap[col] if fmap[col] in FAKER_OPTIONS else FAKER_OPTIONS[0]
+                    chosen  = st.selectbox(
+                        col, FAKER_OPTIONS,
+                        index=FAKER_OPTIONS.index(current),
+                        key=f"fmap_{table}_{col}",
+                    )
+                    updated_maps[table][col] = chosen
+
+    # Persist edits
+    for table, fmap in updated_maps.items():
+        st.session_state.faker_maps[table] = fmap
+
+    st.divider()
+    if st.button("✨ Generate Fake Data for All Tables", type="primary", key="faker_gen_btn"):
+        st.session_state.faker_dfs = {}
+        gen_prog = st.progress(0, text="Generating...")
+        tables_list = st.session_state.selected_tables
+        for i, table in enumerate(tables_list):
+            gen_prog.progress(i / len(tables_list), text=f"Generating `{table}`...")
+            df_t   = st.session_state.table_dfs.get(table, pd.DataFrame())
+            fmap   = st.session_state.faker_maps.get(table, {})
+            n_rows = st.session_state.fake_row_overrides.get(table, len(df_t))
+            if not fmap:
+                continue
+            dtypes  = {c: df_t[c].dtype for c in df_t.columns}
+            fake_df = generate_fake_dataframe(list(df_t.columns), fmap, dtypes, int(n_rows))
+            if fake_mode == "Append fake rows to existing data" and not df_t.empty:
+                result_df = pd.concat([df_t, fake_df], ignore_index=True)
+            else:
+                result_df = fake_df
+            st.session_state.faker_dfs[table] = result_df
+        gen_prog.progress(1.0, text="Done!")
+        st.session_state.active_output = "fake"
+        st.rerun()
+
+    # Preview
+    if st.session_state.faker_dfs:
+        st.subheader("Preview Generated Fake Data")
+        for table, fdf in st.session_state.faker_dfs.items():
+            with st.expander(f"📋 **{table}** — {len(fdf):,} rows", expanded=False):
+                st.dataframe(fdf.head(20), use_container_width=True)
+
+# ─── Step 4: Export (masked OR fake, whichever was last generated) ────────────
+
+_has_output = bool(st.session_state.table_masked_dfs or st.session_state.faker_dfs)
+_output_type = st.session_state.get("active_output")  # "masked" or "fake"
+
+if _has_output and _output_type:
+    st.divider()
+    _label = "Masked Data" if _output_type == "masked" else "Fake Data"
+    _export_dfs = st.session_state.table_masked_dfs if _output_type == "masked" else st.session_state.faker_dfs
+    _file_prefix = "masked" if _output_type == "masked" else "fake"
+    _zip_name    = "masked_tables.zip" if _output_type == "masked" else "fake_tables.zip"
+
+    st.header(f"Step 4 — Export {_label}")
     conn_type = st.session_state.connection[0] if st.session_state.connection else "csv"
 
-    tab_csv, tab_clone, tab_faker = st.tabs(["📥 Download CSVs", "🗄️ Clone to Database", "🎭 Fake Data Generator"])
+    tab_csv, tab_clone = st.tabs(["📥 Download CSVs", "🗄️ Clone to Database"])
 
-    # ── CSV download tab ──────────────────────────────────────────────────────
+    # ── Download CSVs ─────────────────────────────────────────────────────────
     with tab_csv:
-        st.markdown("Download individual CSVs or a single ZIP containing all tables.")
-
-        # Individual downloads
+        st.markdown(f"Download individual CSVs or a single ZIP of all {_label.lower()}.")
         st.subheader("Individual tables")
-        dl_cols = st.columns(min(len(st.session_state.table_masked_dfs), 4))
-        for i, (table, mdf) in enumerate(st.session_state.table_masked_dfs.items()):
+        dl_cols = st.columns(min(len(_export_dfs), 4))
+        for i, (table, edf) in enumerate(_export_dfs.items()):
             buf = io.BytesIO()
-            mdf.to_csv(buf, index=False)
+            edf.to_csv(buf, index=False)
             with dl_cols[i % 4]:
                 st.download_button(
                     label=f"⬇️ {table}.csv",
                     data=buf.getvalue(),
-                    file_name=f"masked_{table}.csv",
+                    file_name=f"{_file_prefix}_{table}.csv",
                     mime="text/csv",
-                    key=f"dl_{table}",
+                    key=f"dl4_{table}",
                 )
-
-        # ZIP download
         st.subheader("All tables as ZIP")
         zip_buf = io.BytesIO()
         with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
-            for table, mdf in st.session_state.table_masked_dfs.items():
-                csv_bytes = mdf.to_csv(index=False).encode("utf-8")
-                zf.writestr(f"masked_{table}.csv", csv_bytes)
+            for table, edf in _export_dfs.items():
+                zf.writestr(f"{_file_prefix}_{table}.csv", edf.to_csv(index=False).encode("utf-8"))
         st.download_button(
-            label="⬇️ Download All as ZIP",
+            label=f"⬇️ Download All as ZIP",
             data=zip_buf.getvalue(),
-            file_name="masked_tables.zip",
+            file_name=_zip_name,
             mime="application/zip",
+            key="dl4_zip",
         )
 
-    # ── Clone to DB tab ───────────────────────────────────────────────────────
+    # ── Clone to Database ─────────────────────────────────────────────────────
     with tab_clone:
         if conn_type == "csv":
-            st.info("Clone to database is not available for CSV uploads. Use the CSV download tab.")
+            st.info("Clone to database is not available for CSV uploads. Use the Download tab.")
         else:
             st.markdown(
-                "Write all masked tables into a **new database/schema** on the same server, "
+                f"Write all {_label.lower()} into a **new database/schema** on the same server, "
                 "leaving the original data untouched."
             )
+            _default_suffix = "_MASKED" if _output_type == "masked" else "_FAKE"
             if conn_type == "snowflake":
-                _, conn, src_db, src_schema = st.session_state.connection
+                _, conn_w, src_db, src_schema = st.session_state.connection
                 c1, c2 = st.columns(2)
-                with c1: tgt_db     = st.text_input("Target Database", value=f"{src_db}_MASKED")
-                with c2: tgt_schema = st.text_input("Target Schema",   value=src_schema)
-
-                if st.button("🚀 Create Clone & Write Masked Data", type="primary"):
-                    with st.spinner("Writing masked tables to Snowflake..."):
-                        results = snowflake_create_clone_schema(
-                            conn, src_db, src_schema, tgt_db, tgt_schema,
-                            st.session_state.table_masked_dfs
-                        )
+                with c1: tgt_db     = st.text_input("Target Database", value=f"{src_db}{_default_suffix}", key="tgt_db4")
+                with c2: tgt_schema = st.text_input("Target Schema",   value=src_schema,                   key="tgt_sch4")
+                if st.button(f"🚀 Write {_label} to Snowflake", type="primary", key="write4_sf"):
+                    with st.spinner("Writing to Snowflake..."):
+                        results = snowflake_create_clone_schema(conn_w, src_db, src_schema, tgt_db, tgt_schema, _export_dfs)
                     for tbl, msg in results.items():
                         st.write(f"**{tbl}**: {msg}")
-
             elif conn_type == "sqlserver":
-                _, engine = st.session_state.connection
-                src_db  = str(engine.url).rsplit("/", 1)[-1]
-                tgt_db  = st.text_input("Target Database", value=f"{src_db}_Masked")
-
-                if st.button("🚀 Create Clone DB & Write Masked Data", type="primary"):
-                    with st.spinner("Writing masked tables to SQL Server..."):
-                        results = sqlserver_create_clone_db(
-                            engine, tgt_db,
-                            st.session_state.table_masked_dfs
-                        )
+                _, engine_w = st.session_state.connection
+                src_db = str(engine_w.url).rsplit("/", 1)[-1]
+                tgt_db = st.text_input("Target Database", value=f"{src_db}{_default_suffix}", key="tgt_db4_sql")
+                if st.button(f"🚀 Write {_label} to SQL Server", type="primary", key="write4_sql"):
+                    with st.spinner("Writing to SQL Server..."):
+                        results = sqlserver_create_clone_db(engine_w, tgt_db, _export_dfs)
                     for tbl, msg in results.items():
                         st.write(f"**{tbl}**: {msg}")
-
-    # ── Faker tab ─────────────────────────────────────────────────────────────
-    with tab_faker:
-        st.markdown(
-            "Generate **realistic fake data** for all selected tables using the Faker library. "
-            "AI maps each column to the best Faker method. You can review and edit mappings, "
-            "then generate a replacement dataset or append extra rows."
-        )
-
-        # ── Mode & row count ──────────────────────────────────────────────────
-        f_col1, f_col2 = st.columns([2, 2])
-        with f_col1:
-            fake_mode = st.radio(
-                "Generation mode",
-                ["Replace all data with fake data", "Append fake rows to existing data"],
-                help="Replace: discard original rows entirely. Append: add fake rows below original data.",
-            )
-        with f_col2:
-            original_row_counts = {
-                t: len(st.session_state.table_dfs.get(t, pd.DataFrame()))
-                for t in st.session_state.selected_tables
-            }
-            default_rows = max(original_row_counts.values()) if original_row_counts else 100
-            fake_row_count = st.number_input(
-                "Number of fake rows to generate (per table)",
-                min_value=1, max_value=1_000_000,
-                value=int(default_rows),
-                help="In Replace mode this is the total rows. In Append mode these rows are added on top.",
-            )
-
-        st.divider()
-
-        # ── Step A: AI column mapping ─────────────────────────────────────────
-        map_btn = st.button("🤖 Auto-map Columns with AI", type="primary",
-                            key="faker_map_btn")
-        if map_btn:
-            st.session_state.faker_maps   = {}
-            st.session_state.faker_mapped = False
-            st.session_state.faker_dfs    = {}
-
-            # Resolve AI connection
-            if ai_engine == "Ollama (LLaMA)":
-                _fai_engine = "Ollama (LLaMA)"
-                _fai_sf_conn = None
-            else:
-                _fai_engine = "Snowflake Cortex"
-                if st.session_state.connection and st.session_state.connection[0] == "snowflake":
-                    _fai_sf_conn = st.session_state.connection[1]
-                elif st.session_state.get("cortex_conn"):
-                    _fai_sf_conn = st.session_state["cortex_conn"]
-                else:
-                    _fai_sf_conn = None
-
-            prog = st.progress(0, text="Mapping columns...")
-            tables_list = st.session_state.selected_tables
-            for i, table in enumerate(tables_list):
-                df_t = st.session_state.table_dfs.get(table, pd.DataFrame())
-                if df_t.empty:
-                    continue
-                prog.progress((i) / len(tables_list), text=f"Mapping `{table}`...")
-                fmap = ai_map_faker_columns(
-                    list(df_t.columns), _fai_engine,
-                    ollama_url=ollama_url, ollama_model=ollama_model,
-                    ollama_timeout=int(ollama_timeout),
-                    sf_conn=_fai_sf_conn, cortex_model=cortex_model,
-                )
-                st.session_state.faker_maps[table] = fmap
-            prog.progress(1.0, text="Mapping complete!")
-            st.session_state.faker_mapped = True
-            st.rerun()
-
-        # ── Step B: Review & edit mappings ────────────────────────────────────
-        if st.session_state.faker_mapped and st.session_state.faker_maps:
-            st.subheader("Review Column → Faker Mappings")
-            st.caption("Each column is mapped to a Faker method. Edit any mapping before generating.")
-
-            FAKER_OPTIONS = sorted([
-                "name","first_name","last_name","email","phone_number","ssn",
-                "address","street_address","city","state","zipcode","postcode",
-                "country","company","user_name","password","ipv4","ipv6","url",
-                "date_of_birth","date","credit_card_number","iban","bban",
-                "text","sentence","word","uuid4","job","latitude","longitude",
-                "random_int","pyfloat","random_element",
-            ])
-
-            updated_maps = {}
-            for table in st.session_state.selected_tables:
-                fmap = st.session_state.faker_maps.get(table, {})
-                if not fmap:
-                    continue
-                df_t = st.session_state.table_dfs.get(table, pd.DataFrame())
-                with st.expander(f"📋 **{table}** — {len(fmap)} columns", expanded=False):
-                    updated_maps[table] = {}
-                    # Render in a 3-column grid
-                    cols_list = list(fmap.keys())
-                    grid = st.columns(3)
-                    for ci, col in enumerate(cols_list):
-                        with grid[ci % 3]:
-                            current = fmap[col] if fmap[col] in FAKER_OPTIONS else FAKER_OPTIONS[0]
-                            chosen = st.selectbox(
-                                col,
-                                FAKER_OPTIONS,
-                                index=FAKER_OPTIONS.index(current),
-                                key=f"fmap_{table}_{col}",
-                            )
-                            updated_maps[table][col] = chosen
-
-            # Persist edits back
-            for table, fmap in updated_maps.items():
-                st.session_state.faker_maps[table] = fmap
-
-            st.divider()
-
-            # ── Step C: Generate ──────────────────────────────────────────────
-            if st.button("✨ Generate Fake Data", type="primary", key="faker_gen_btn"):
-                st.session_state.faker_dfs = {}
-                gen_prog = st.progress(0, text="Generating...")
-                tables_list = st.session_state.selected_tables
-                for i, table in enumerate(tables_list):
-                    gen_prog.progress(i / len(tables_list), text=f"Generating `{table}`...")
-                    df_t  = st.session_state.table_dfs.get(table, pd.DataFrame())
-                    fmap  = st.session_state.faker_maps.get(table, {})
-                    if not fmap:
-                        continue
-                    dtypes = {c: df_t[c].dtype for c in df_t.columns}
-                    fake_df = generate_fake_dataframe(
-                        list(df_t.columns), fmap, dtypes, int(fake_row_count)
-                    )
-                    if fake_mode == "Append fake rows to existing data" and not df_t.empty:
-                        result_df = pd.concat([df_t, fake_df], ignore_index=True)
-                    else:
-                        result_df = fake_df
-                    st.session_state.faker_dfs[table] = result_df
-                gen_prog.progress(1.0, text="Done!")
-                st.rerun()
-
-            # ── Step D: Preview & download generated data ─────────────────────
-            if st.session_state.faker_dfs:
-                st.subheader("Generated Fake Data")
-                for table, fdf in st.session_state.faker_dfs.items():
-                    with st.expander(f"📋 **{table}** — {len(fdf):,} rows", expanded=False):
-                        st.dataframe(fdf.head(20), use_container_width=True)
-
-                st.subheader("Download")
-                dl_fcols = st.columns(min(len(st.session_state.faker_dfs), 4))
-                for i, (table, fdf) in enumerate(st.session_state.faker_dfs.items()):
-                    buf = io.BytesIO()
-                    fdf.to_csv(buf, index=False)
-                    with dl_fcols[i % 4]:
-                        st.download_button(
-                            label=f"⬇️ {table}_fake.csv",
-                            data=buf.getvalue(),
-                            file_name=f"fake_{table}.csv",
-                            mime="text/csv",
-                            key=f"fdl_{table}",
-                        )
-
-                zip_fbuf = io.BytesIO()
-                with zipfile.ZipFile(zip_fbuf, "w", zipfile.ZIP_DEFLATED) as zf:
-                    for table, fdf in st.session_state.faker_dfs.items():
-                        zf.writestr(f"fake_{table}.csv", fdf.to_csv(index=False).encode("utf-8"))
-                st.download_button(
-                    label="⬇️ Download All Fake Data as ZIP",
-                    data=zip_fbuf.getvalue(),
-                    file_name="fake_tables.zip",
-                    mime="application/zip",
-                    key="fdl_zip",
-                )
-
-                # Write-back to DB option
-                conn_type_f = st.session_state.connection[0] if st.session_state.connection else "csv"
-                if conn_type_f != "csv":
-                    st.subheader("Write to Database")
-                    st.markdown("Optionally push the generated fake data directly to a new database/schema.")
-                    if conn_type_f == "snowflake":
-                        _, sf_conn_w, src_db_f, src_sch_f = st.session_state.connection
-                        fc1, fc2 = st.columns(2)
-                        with fc1: ftgt_db  = st.text_input("Target Database", value=f"{src_db_f}_FAKE", key="ftgt_db")
-                        with fc2: ftgt_sch = st.text_input("Target Schema",   value=src_sch_f,             key="ftgt_sch")
-                        if st.button("🚀 Write Fake Data to Snowflake", type="primary", key="fwrite_sf"):
-                            with st.spinner("Writing..."):
-                                results = snowflake_create_clone_schema(
-                                    sf_conn_w, src_db_f, src_sch_f, ftgt_db, ftgt_sch,
-                                    st.session_state.faker_dfs
-                                )
-                            for tbl, msg in results.items():
-                                st.write(f"**{tbl}**: {msg}")
-                    elif conn_type_f == "sqlserver":
-                        _, sql_eng_w = st.session_state.connection
-                        src_db_f = str(sql_eng_w.url).rsplit("/", 1)[-1]
-                        ftgt_db  = st.text_input("Target Database", value=f"{src_db_f}_Fake", key="ftgt_db_sql")
-                        if st.button("🚀 Write Fake Data to SQL Server", type="primary", key="fwrite_sql"):
-                            with st.spinner("Writing..."):
-                                results = sqlserver_create_clone_db(sql_eng_w, ftgt_db, st.session_state.faker_dfs)
-                            for tbl, msg in results.items():
-                                st.write(f"**{tbl}**: {msg}")
 
 elif st.session_state.connection is None:
     st.info("👈 Select a data source in the sidebar and click Connect to begin.")
@@ -1014,15 +996,15 @@ elif st.session_state.connection is None:
 #```bash
 #pip install streamlit pandas snowflake-connector-python requests pyodbc sqlalchemy faker
 #```
-#
+
 #**Ollama setup:**
 #```bash
 #ollama pull llama3
 #ollama serve   # runs on http://localhost:11434
 #```
-#
+
 #**Masking rules:**
-#
+
 #| Value length | Example | Masked |
 #|---|---|---|
 #| ≤ 4 chars | `John` | `****` |
