@@ -6,6 +6,8 @@ import json
 import zipfile
 import requests
 import pyodbc
+from faker import Faker
+from faker.providers import internet, person, address, phone_number, company, date_time, bank, misc
 from sqlalchemy import create_engine, inspect, text
 from snowflake.connector import connect
 
@@ -42,6 +44,168 @@ def mask_dataframe(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
         if col in masked.columns:
             masked[col] = mask_column(masked[col])
     return masked
+
+
+# ─── Faker helpers ────────────────────────────────────────────────────────────
+
+_faker = Faker()
+
+# Map of semantic keywords → Faker callable names
+FAKER_TYPE_MAP = {
+    "name":         "name",
+    "first_name":   "first_name",
+    "last_name":    "last_name",
+    "fname":        "first_name",
+    "lname":        "last_name",
+    "email":        "email",
+    "mail":         "email",
+    "phone":        "phone_number",
+    "mobile":       "phone_number",
+    "cell":         "phone_number",
+    "ssn":          "ssn",
+    "street":       "street_address",
+    "address":      "address",
+    "addr":         "address",
+    "city":         "city",
+    "state":        "state",
+    "zip":          "zipcode",
+    "postal":       "postcode",
+    "country":      "country",
+    "company":      "company",
+    "org":          "company",
+    "username":     "user_name",
+    "user":         "user_name",
+    "password":     "password",
+    "ip":           "ipv4",
+    "ipv4":         "ipv4",
+    "ipv6":         "ipv6",
+    "url":          "url",
+    "dob":          "date_of_birth",
+    "birth":        "date_of_birth",
+    "date":         "date",
+    "credit_card":  "credit_card_number",
+    "card":         "credit_card_number",
+    "cc":           "credit_card_number",
+    "iban":         "iban",
+    "account":      "bban",
+    "text":         "text",
+    "description":  "sentence",
+    "note":         "sentence",
+    "comment":      "sentence",
+    "id":           "uuid4",
+    "uuid":         "uuid4",
+    "gender":       "random_element",
+    "nationality":  "country",
+    "job":          "job",
+    "title":        "job",
+    "age":          "random_int",
+    "number":       "random_int",
+    "amount":       "pyfloat",
+    "price":        "pyfloat",
+    "salary":       "random_int",
+    "latitude":     "latitude",
+    "longitude":    "longitude",
+    "lat":          "latitude",
+    "lon":          "longitude",
+    "lng":          "longitude",
+}
+
+def guess_faker_type(col_name: str) -> str:
+    """Guess a Faker provider name from the column name using keyword matching."""
+    col_lower = col_name.lower().replace("-", "_").replace(" ", "_")
+    for keyword, faker_fn in FAKER_TYPE_MAP.items():
+        if keyword in col_lower:
+            return faker_fn
+    return "word"  # fallback
+
+def generate_fake_value(faker_fn: str) -> str:
+    """Generate a single fake value using the given Faker method name."""
+    try:
+        fn = getattr(_faker, faker_fn)
+        if faker_fn == "random_element":
+            return fn(elements=["Male", "Female", "Non-binary"])
+        elif faker_fn in ("pyfloat", "random_int"):
+            return str(fn(min_value=0, max_value=99999))
+        return str(fn())
+    except Exception:
+        return str(_faker.word())
+
+def build_faker_prompt(columns: list[str]) -> str:
+    return f"""You are a data generation assistant. Given a list of database column names, assign the most appropriate Faker library method name for generating fake data for each column.
+
+Available Faker methods include: name, first_name, last_name, email, phone_number, ssn, address, street_address, city, state, zipcode, country, company, user_name, password, ipv4, url, date_of_birth, date, credit_card_number, iban, bban, text, sentence, uuid4, job, latitude, longitude, random_int, pyfloat, word.
+
+Rules:
+- Return ONLY a JSON object where keys are column names and values are Faker method names.
+- Do NOT include explanations or markdown fences.
+- If a column is clearly a numeric ID or primary key, use "random_int".
+- If unsure, use "word".
+
+Columns: {json.dumps(columns)}
+
+Response (JSON object only):"""
+
+def ai_map_faker_columns(columns: list[str], ai_engine: str,
+                          ollama_url=None, ollama_model=None, ollama_timeout=180,
+                          sf_conn=None, cortex_model=None) -> dict[str, str]:
+    """Use AI to map column names to Faker method names. Falls back to keyword matching."""
+    prompt = build_faker_prompt(columns)
+    raw = ""
+    try:
+        if ai_engine == "Ollama (LLaMA)" and ollama_url and ollama_model:
+            resp = requests.post(
+                f"{ollama_url.rstrip('/')}/api/chat",
+                json={
+                    "model": ollama_model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "stream": False,
+                    "options": {"temperature": 0, "num_predict": 512},
+                },
+                timeout=ollama_timeout,
+            )
+            resp.raise_for_status()
+            raw = resp.json()["message"]["content"].strip()
+        elif ai_engine == "Snowflake Cortex" and sf_conn and cortex_model:
+            cur = sf_conn.cursor()
+            escaped = prompt.replace("'", "\'")
+            cur.execute(f"SELECT SNOWFLAKE.CORTEX.COMPLETE('{cortex_model}', '{escaped}')")
+            row = cur.fetchone()
+            raw = (row[0] if row else "").strip()
+
+        raw = re.sub(r"^```(?:json)?|```$", "", raw, flags=re.MULTILINE).strip()
+        result = json.loads(raw)
+        if isinstance(result, dict):
+            # Validate each value is a real Faker method, fallback if not
+            mapped = {}
+            for col in columns:
+                fn = result.get(col, guess_faker_type(col))
+                if not hasattr(_faker, fn):
+                    fn = guess_faker_type(col)
+                mapped[col] = fn
+            return mapped
+    except Exception:
+        pass
+    # Full fallback: keyword-based mapping
+    return {col: guess_faker_type(col) for col in columns}
+
+def generate_fake_dataframe(columns: list[str], faker_map: dict[str, str],
+                              dtypes: dict, n_rows: int) -> pd.DataFrame:
+    """Generate a DataFrame of n_rows fake values using the given faker_map."""
+    data = {}
+    for col in columns:
+        fn = faker_map.get(col, "word")
+        values = [generate_fake_value(fn) for _ in range(n_rows)]
+        # Attempt to cast back to original dtype
+        try:
+            dtype = dtypes.get(col)
+            if dtype and "int" in str(dtype):
+                values = [int(re.sub(r"[^0-9]", "", str(v)) or 0) for v in values]
+            elif dtype and "float" in str(dtype):
+                values = [float(re.sub(r"[^0-9.]", "", str(v)) or 0.0) for v in values]
+        except Exception:
+            pass
+        data[col] = values
+    return pd.DataFrame(data)
 
 # ─── Ollama ───────────────────────────────────────────────────────────────────
 
@@ -314,6 +478,9 @@ defaults = {
     "table_final_cols": {}, # {table: [user-confirmed cols]}
     "table_masked_dfs": {}, # {table: masked df}
     "detection_done": False,
+    "faker_maps": {},        # {table: {col: faker_fn}}
+    "faker_mapped": False,
+    "faker_dfs": {},         # {table: generated fake df}
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -542,10 +709,9 @@ if st.session_state.detection_done and st.session_state.table_pii_cols:
                         st.markdown(f"**Masking Preview — `{table}`** *(first 10 rows of selected PII columns)*")
                         orig   = df[final_cols].head(10)
                         masked = orig.apply(mask_column)
-                        t1, t2 = st.tabs(["Masked", "Original"])
-                        with t1: st.dataframe(masked, use_container_width=True)
-                        with t2: st.dataframe(orig, use_container_width=True)
-
+                        t1, t2 = st.tabs(["Original", "Masked"])
+                        with t1: st.dataframe(orig, use_container_width=True)
+                        with t2: st.dataframe(masked, use_container_width=True)
 
     # ── Apply masking button ──────────────────────────────────────────────────
     st.divider()
@@ -560,7 +726,7 @@ if st.session_state.detection_done and st.session_state.table_pii_cols:
         st.success("✅ Masking applied to all tables!")
         st.rerun()
 
-# ─── Step 4: Download / Clone ─────────────────────────────────────────────────
+# ─── Step 4: Download / Clone / Fake Data ────────────────────────────────────
 
 if st.session_state.table_masked_dfs:
     st.divider()
@@ -568,7 +734,7 @@ if st.session_state.table_masked_dfs:
 
     conn_type = st.session_state.connection[0] if st.session_state.connection else "csv"
 
-    tab_csv, tab_clone = st.tabs(["📥 Download CSVs", "🗄️ Clone to Database"])
+    tab_csv, tab_clone, tab_faker = st.tabs(["📥 Download CSVs", "🗄️ Clone to Database", "🎭 Fake Data Generator"])
 
     # ── CSV download tab ──────────────────────────────────────────────────────
     with tab_csv:
@@ -641,6 +807,202 @@ if st.session_state.table_masked_dfs:
                     for tbl, msg in results.items():
                         st.write(f"**{tbl}**: {msg}")
 
+    # ── Faker tab ─────────────────────────────────────────────────────────────
+    with tab_faker:
+        st.markdown(
+            "Generate **realistic fake data** for all selected tables using the Faker library. "
+            "AI maps each column to the best Faker method. You can review and edit mappings, "
+            "then generate a replacement dataset or append extra rows."
+        )
+
+        # ── Mode & row count ──────────────────────────────────────────────────
+        f_col1, f_col2 = st.columns([2, 2])
+        with f_col1:
+            fake_mode = st.radio(
+                "Generation mode",
+                ["Replace all data with fake data", "Append fake rows to existing data"],
+                help="Replace: discard original rows entirely. Append: add fake rows below original data.",
+            )
+        with f_col2:
+            original_row_counts = {
+                t: len(st.session_state.table_dfs.get(t, pd.DataFrame()))
+                for t in st.session_state.selected_tables
+            }
+            default_rows = max(original_row_counts.values()) if original_row_counts else 100
+            fake_row_count = st.number_input(
+                "Number of fake rows to generate (per table)",
+                min_value=1, max_value=1_000_000,
+                value=int(default_rows),
+                help="In Replace mode this is the total rows. In Append mode these rows are added on top.",
+            )
+
+        st.divider()
+
+        # ── Step A: AI column mapping ─────────────────────────────────────────
+        map_btn = st.button("🤖 Auto-map Columns with AI", type="primary",
+                            key="faker_map_btn")
+        if map_btn:
+            st.session_state.faker_maps   = {}
+            st.session_state.faker_mapped = False
+            st.session_state.faker_dfs    = {}
+
+            # Resolve AI connection
+            if ai_engine == "Ollama (LLaMA)":
+                _fai_engine = "Ollama (LLaMA)"
+                _fai_sf_conn = None
+            else:
+                _fai_engine = "Snowflake Cortex"
+                if st.session_state.connection and st.session_state.connection[0] == "snowflake":
+                    _fai_sf_conn = st.session_state.connection[1]
+                elif st.session_state.get("cortex_conn"):
+                    _fai_sf_conn = st.session_state["cortex_conn"]
+                else:
+                    _fai_sf_conn = None
+
+            prog = st.progress(0, text="Mapping columns...")
+            tables_list = st.session_state.selected_tables
+            for i, table in enumerate(tables_list):
+                df_t = st.session_state.table_dfs.get(table, pd.DataFrame())
+                if df_t.empty:
+                    continue
+                prog.progress((i) / len(tables_list), text=f"Mapping `{table}`...")
+                fmap = ai_map_faker_columns(
+                    list(df_t.columns), _fai_engine,
+                    ollama_url=ollama_url, ollama_model=ollama_model,
+                    ollama_timeout=int(ollama_timeout),
+                    sf_conn=_fai_sf_conn, cortex_model=cortex_model,
+                )
+                st.session_state.faker_maps[table] = fmap
+            prog.progress(1.0, text="Mapping complete!")
+            st.session_state.faker_mapped = True
+            st.rerun()
+
+        # ── Step B: Review & edit mappings ────────────────────────────────────
+        if st.session_state.faker_mapped and st.session_state.faker_maps:
+            st.subheader("Review Column → Faker Mappings")
+            st.caption("Each column is mapped to a Faker method. Edit any mapping before generating.")
+
+            FAKER_OPTIONS = sorted([
+                "name","first_name","last_name","email","phone_number","ssn",
+                "address","street_address","city","state","zipcode","postcode",
+                "country","company","user_name","password","ipv4","ipv6","url",
+                "date_of_birth","date","credit_card_number","iban","bban",
+                "text","sentence","word","uuid4","job","latitude","longitude",
+                "random_int","pyfloat","random_element",
+            ])
+
+            updated_maps = {}
+            for table in st.session_state.selected_tables:
+                fmap = st.session_state.faker_maps.get(table, {})
+                if not fmap:
+                    continue
+                df_t = st.session_state.table_dfs.get(table, pd.DataFrame())
+                with st.expander(f"📋 **{table}** — {len(fmap)} columns", expanded=False):
+                    updated_maps[table] = {}
+                    # Render in a 3-column grid
+                    cols_list = list(fmap.keys())
+                    grid = st.columns(3)
+                    for ci, col in enumerate(cols_list):
+                        with grid[ci % 3]:
+                            current = fmap[col] if fmap[col] in FAKER_OPTIONS else FAKER_OPTIONS[0]
+                            chosen = st.selectbox(
+                                col,
+                                FAKER_OPTIONS,
+                                index=FAKER_OPTIONS.index(current),
+                                key=f"fmap_{table}_{col}",
+                            )
+                            updated_maps[table][col] = chosen
+
+            # Persist edits back
+            for table, fmap in updated_maps.items():
+                st.session_state.faker_maps[table] = fmap
+
+            st.divider()
+
+            # ── Step C: Generate ──────────────────────────────────────────────
+            if st.button("✨ Generate Fake Data", type="primary", key="faker_gen_btn"):
+                st.session_state.faker_dfs = {}
+                gen_prog = st.progress(0, text="Generating...")
+                tables_list = st.session_state.selected_tables
+                for i, table in enumerate(tables_list):
+                    gen_prog.progress(i / len(tables_list), text=f"Generating `{table}`...")
+                    df_t  = st.session_state.table_dfs.get(table, pd.DataFrame())
+                    fmap  = st.session_state.faker_maps.get(table, {})
+                    if not fmap:
+                        continue
+                    dtypes = {c: df_t[c].dtype for c in df_t.columns}
+                    fake_df = generate_fake_dataframe(
+                        list(df_t.columns), fmap, dtypes, int(fake_row_count)
+                    )
+                    if fake_mode == "Append fake rows to existing data" and not df_t.empty:
+                        result_df = pd.concat([df_t, fake_df], ignore_index=True)
+                    else:
+                        result_df = fake_df
+                    st.session_state.faker_dfs[table] = result_df
+                gen_prog.progress(1.0, text="Done!")
+                st.rerun()
+
+            # ── Step D: Preview & download generated data ─────────────────────
+            if st.session_state.faker_dfs:
+                st.subheader("Generated Fake Data")
+                for table, fdf in st.session_state.faker_dfs.items():
+                    with st.expander(f"📋 **{table}** — {len(fdf):,} rows", expanded=False):
+                        st.dataframe(fdf.head(20), use_container_width=True)
+
+                st.subheader("Download")
+                dl_fcols = st.columns(min(len(st.session_state.faker_dfs), 4))
+                for i, (table, fdf) in enumerate(st.session_state.faker_dfs.items()):
+                    buf = io.BytesIO()
+                    fdf.to_csv(buf, index=False)
+                    with dl_fcols[i % 4]:
+                        st.download_button(
+                            label=f"⬇️ {table}_fake.csv",
+                            data=buf.getvalue(),
+                            file_name=f"fake_{table}.csv",
+                            mime="text/csv",
+                            key=f"fdl_{table}",
+                        )
+
+                zip_fbuf = io.BytesIO()
+                with zipfile.ZipFile(zip_fbuf, "w", zipfile.ZIP_DEFLATED) as zf:
+                    for table, fdf in st.session_state.faker_dfs.items():
+                        zf.writestr(f"fake_{table}.csv", fdf.to_csv(index=False).encode("utf-8"))
+                st.download_button(
+                    label="⬇️ Download All Fake Data as ZIP",
+                    data=zip_fbuf.getvalue(),
+                    file_name="fake_tables.zip",
+                    mime="application/zip",
+                    key="fdl_zip",
+                )
+
+                # Write-back to DB option
+                conn_type_f = st.session_state.connection[0] if st.session_state.connection else "csv"
+                if conn_type_f != "csv":
+                    st.subheader("Write to Database")
+                    st.markdown("Optionally push the generated fake data directly to a new database/schema.")
+                    if conn_type_f == "snowflake":
+                        _, sf_conn_w, src_db_f, src_sch_f = st.session_state.connection
+                        fc1, fc2 = st.columns(2)
+                        with fc1: ftgt_db  = st.text_input("Target Database", value=f"{src_db_f}_FAKE", key="ftgt_db")
+                        with fc2: ftgt_sch = st.text_input("Target Schema",   value=src_sch_f,             key="ftgt_sch")
+                        if st.button("🚀 Write Fake Data to Snowflake", type="primary", key="fwrite_sf"):
+                            with st.spinner("Writing..."):
+                                results = snowflake_create_clone_schema(
+                                    sf_conn_w, src_db_f, src_sch_f, ftgt_db, ftgt_sch,
+                                    st.session_state.faker_dfs
+                                )
+                            for tbl, msg in results.items():
+                                st.write(f"**{tbl}**: {msg}")
+                    elif conn_type_f == "sqlserver":
+                        _, sql_eng_w = st.session_state.connection
+                        src_db_f = str(sql_eng_w.url).rsplit("/", 1)[-1]
+                        ftgt_db  = st.text_input("Target Database", value=f"{src_db_f}_Fake", key="ftgt_db_sql")
+                        if st.button("🚀 Write Fake Data to SQL Server", type="primary", key="fwrite_sql"):
+                            with st.spinner("Writing..."):
+                                results = sqlserver_create_clone_db(sql_eng_w, ftgt_db, st.session_state.faker_dfs)
+                            for tbl, msg in results.items():
+                                st.write(f"**{tbl}**: {msg}")
+
 elif st.session_state.connection is None:
     st.info("👈 Select a data source in the sidebar and click Connect to begin.")
 
@@ -650,7 +1012,7 @@ elif st.session_state.connection is None:
 #    st.markdown("""
 #**Install packages:**
 #```bash
-#pip install streamlit pandas snowflake-connector-python requests pyodbc sqlalchemy
+#pip install streamlit pandas snowflake-connector-python requests pyodbc sqlalchemy faker
 #```
 #
 #**Ollama setup:**
