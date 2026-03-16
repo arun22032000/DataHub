@@ -748,6 +748,7 @@ if st.session_state.connection and st.session_state.tables:
     with btn_col2:
         fetch_fake_btn = st.button(
             f"🎭 Fetch & Generate Fake Data — {len(st.session_state.selected_tables)} table(s)",
+            type="primary",
             disabled=not st.session_state.selected_tables,
             use_container_width=True,
         )
@@ -1148,4 +1149,3 @@ if _has_output and _output_type:
 
 elif st.session_state.connection is None:
     st.info("👈 Select a data source in the sidebar and click Connect to begin.")
-
