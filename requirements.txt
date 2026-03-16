@@ -2,5 +2,6 @@ streamlit
 pandas
 requests
 pyodbc
+Faker
 sqlalchemy
 snowflake-connector-python
