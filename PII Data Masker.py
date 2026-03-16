@@ -50,106 +50,254 @@ def mask_dataframe(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
 
 _faker = Faker()
 
-# Map of semantic keywords → Faker callable names
+# Keyword → Faker method map
 FAKER_TYPE_MAP = {
-    "name":         "name",
-    "first_name":   "first_name",
-    "last_name":    "last_name",
-    "fname":        "first_name",
-    "lname":        "last_name",
-    "email":        "email",
-    "mail":         "email",
-    "phone":        "phone_number",
-    "mobile":       "phone_number",
-    "cell":         "phone_number",
-    "ssn":          "ssn",
-    "street":       "street_address",
-    "address":      "address",
-    "addr":         "address",
-    "city":         "city",
-    "state":        "state",
-    "zip":          "zipcode",
-    "postal":       "postcode",
-    "country":      "country",
-    "company":      "company",
-    "org":          "company",
-    "username":     "user_name",
-    "user":         "user_name",
-    "password":     "password",
-    "ip":           "ipv4",
-    "ipv4":         "ipv4",
-    "ipv6":         "ipv6",
-    "url":          "url",
-    "dob":          "date_of_birth",
-    "birth":        "date_of_birth",
-    "date":         "date",
-    "credit_card":  "credit_card_number",
-    "card":         "credit_card_number",
-    "cc":           "credit_card_number",
-    "iban":         "iban",
-    "account":      "bban",
-    "text":         "text",
-    "description":  "sentence",
-    "note":         "sentence",
-    "comment":      "sentence",
-    "id":           "uuid4",
-    "uuid":         "uuid4",
-    "gender":       "random_element",
-    "nationality":  "country",
-    "job":          "job",
-    "title":        "job",
-    "age":          "random_int",
-    "number":       "random_int",
-    "amount":       "pyfloat",
-    "price":        "pyfloat",
-    "salary":       "random_int",
-    "latitude":     "latitude",
-    "longitude":    "longitude",
-    "lat":          "latitude",
-    "lon":          "longitude",
-    "lng":          "longitude",
+    "name": "name", "first_name": "first_name", "last_name": "last_name",
+    "fname": "first_name", "lname": "last_name", "email": "email", "mail": "email",
+    "phone": "phone_number", "mobile": "phone_number", "cell": "phone_number",
+    "ssn": "ssn", "street": "street_address", "address": "address", "addr": "address",
+    "city": "city", "state": "state_abbr", "zip": "zipcode", "postal": "postcode",
+    "country": "country", "company": "company", "org": "company",
+    "username": "user_name", "user": "user_name", "password": "password",
+    "ip": "ipv4", "ipv4": "ipv4", "ipv6": "ipv6", "url": "url",
+    "dob": "date_of_birth", "birth": "date_of_birth", "date": "date_this_decade",
+    "credit_card": "credit_card_number", "card": "credit_card_number", "cc": "credit_card_number",
+    "iban": "iban", "account": "bban", "text": "text", "description": "sentence",
+    "note": "sentence", "comment": "sentence", "id": "random_int", "uuid": "uuid4",
+    "gender": "random_element", "nationality": "country", "job": "job", "title": "job",
+    "age": "random_int", "amount": "pyfloat", "price": "pyfloat", "salary": "random_int",
+    "latitude": "latitude", "longitude": "longitude", "lat": "latitude",
+    "lon": "longitude", "lng": "longitude", "number": "random_int",
+    "flag": "boolean", "active": "boolean", "enabled": "boolean", "bool": "boolean",
+    "code": "bothify", "sku": "bothify", "ref": "bothify",
+    "color": "color_name", "colour": "color_name",
+    "currency": "currency_code", "locale": "locale",
+    "time": "time", "timestamp": "date_time_this_decade",
+    "year": "year", "month": "month_name", "day": "day_of_week",
+    "sentence": "sentence", "paragraph": "paragraph",
+    "suffix": "suffix", "prefix": "prefix",
+    "county": "state", "region": "state", "district": "state",
+    "suite": "secondary_address", "apt": "secondary_address",
+    "manager": "name", "owner": "name", "employee": "name",
 }
 
 def guess_faker_type(col_name: str) -> str:
-    """Guess a Faker provider name from the column name using keyword matching."""
+    """Guess Faker method from column name using keyword matching."""
     col_lower = col_name.lower().replace("-", "_").replace(" ", "_")
     for keyword, faker_fn in FAKER_TYPE_MAP.items():
         if keyword in col_lower:
             return faker_fn
-    return "word"  # fallback
+    return "__passthrough__"  # signals: infer from dtype/samples at generation time
 
-def generate_fake_value(faker_fn: str) -> str:
-    """Generate a single fake value using the given Faker method name."""
+# ─── Column profile: analyse samples to guide generation ─────────────────────
+
+def _profile_column(series: pd.Series) -> dict:
+    """Derive min, max, nullrate, unique_ratio, date_fmt, enum_values from a sample series."""
+    profile = {"nullable": False, "dtype_str": str(series.dtype)}
+    non_null = series.dropna()
+    if len(series) > 0:
+        profile["nullable"] = series.isna().mean() > 0.0
+        profile["null_rate"] = float(series.isna().mean())
+    else:
+        profile["null_rate"] = 0.0
+
+    if len(non_null) == 0:
+        return profile
+
+    dtype_str = str(series.dtype)
+
+    # Numeric
+    if "int" in dtype_str or "float" in dtype_str:
+        profile["min_val"] = float(non_null.min())
+        profile["max_val"] = float(non_null.max())
+        profile["mean_val"] = float(non_null.mean())
+        return profile
+
+    # Boolean
+    if "bool" in dtype_str:
+        profile["is_bool"] = True
+        return profile
+
+    # Datetime
+    if "datetime" in dtype_str:
+        profile["is_datetime"] = True
+        profile["min_val"] = str(non_null.min())
+        profile["max_val"] = str(non_null.max())
+        return profile
+
+    # String analysis
+    str_vals = non_null.astype(str)
+    unique_ratio = non_null.nunique() / len(non_null)
+    profile["unique_ratio"] = unique_ratio
+
+    # Enum detection: ≤15 unique values covering ≥80% of non-null
+    if non_null.nunique() <= 15 and unique_ratio <= 0.5:
+        profile["enum_values"] = non_null.value_counts().head(15).index.tolist()
+
+    # Date string detection
+    sample_val = str_vals.iloc[0]
+    for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%d/%m/%Y", "%Y/%m/%d",
+                "%d-%m-%Y", "%m-%d-%Y", "%Y-%m-%d %H:%M:%S", "%d-%b-%Y"):
+        try:
+            pd.to_datetime(sample_val, format=fmt)
+            profile["date_fmt"] = fmt
+            profile["is_date_str"] = True
+            break
+        except Exception:
+            pass
+
+    # Numeric-string detection
+    try:
+        numeric_vals = pd.to_numeric(str_vals, errors="coerce")
+        if numeric_vals.notna().mean() > 0.8:
+            profile["min_val"] = float(numeric_vals.min())
+            profile["max_val"] = float(numeric_vals.max())
+            profile["is_numeric_str"] = True
+    except Exception:
+        pass
+
+    # String length profile
+    lengths = str_vals.str.len()
+    profile["min_len"] = int(lengths.min())
+    profile["max_len"] = int(lengths.max())
+
+    return profile
+
+# ─── Smart value generator ────────────────────────────────────────────────────
+
+def _generate_typed_value(faker_fn: str, profile: dict):
+    """Generate a single value respecting the column profile."""
+
+    # Nullable: randomly inject None
+    if profile.get("nullable") and profile.get("null_rate", 0) > 0:
+        import random
+        if random.random() < profile["null_rate"]:
+            return None
+
+    dtype_str = profile.get("dtype_str", "")
+
+    # Boolean
+    if profile.get("is_bool") or "bool" in dtype_str:
+        return _faker.boolean()
+
+    # Enum / categorical
+    if "enum_values" in profile:
+        return _faker.random_element(elements=profile["enum_values"])
+
+    # Datetime column
+    if profile.get("is_datetime"):
+        try:
+            min_dt = pd.to_datetime(profile.get("min_val"))
+            max_dt = pd.to_datetime(profile.get("max_val"))
+            return _faker.date_time_between(start_date=min_dt, end_date=max_dt)
+        except Exception:
+            return _faker.date_time_this_decade()
+
+    # Date string column
+    if profile.get("is_date_str"):
+        fmt = profile.get("date_fmt", "%Y-%m-%d")
+        try:
+            return _faker.date_this_decade(before_today=True, after_today=False).strftime(fmt)
+        except Exception:
+            return _faker.date()
+
+    # Numeric dtype — range-aware
+    if "int" in dtype_str or "float" in dtype_str:
+        mn = int(profile.get("min_val", 0))
+        mx = int(profile.get("max_val", 99999))
+        if "float" in dtype_str:
+            mn_f = float(profile.get("min_val", 0.0))
+            mx_f = float(profile.get("max_val", 99999.0))
+            return round(_faker.pyfloat(min_value=mn_f, max_value=mx_f), 2)
+        return _faker.random_int(min=mn, max=max(mn, mx))
+
+    # Numeric stored as string
+    if profile.get("is_numeric_str"):
+        mn = int(profile.get("min_val", 0))
+        mx = int(profile.get("max_val", 99999))
+        return str(_faker.random_int(min=mn, max=max(mn, mx)))
+
+    # Passthrough: infer from dtype/profile only (no semantic mapping found)
+    if faker_fn == "__passthrough__":
+        if "int" in dtype_str:
+            mn = int(profile.get("min_val", 0))
+            mx = int(profile.get("max_val", 99999))
+            return _faker.random_int(min=mn, max=max(mn, mx))
+        if "float" in dtype_str:
+            mn_f = float(profile.get("min_val", 0.0))
+            mx_f = float(profile.get("max_val", 99999.0))
+            return round(_faker.pyfloat(min_value=mn_f, max_value=mx_f), 2)
+        # Unknown string: match original length range
+        min_l = profile.get("min_len", 3)
+        max_l = profile.get("max_len", 20)
+        return _faker.lexify("?" * min(max_l, 20))
+
+    # Named Faker method with smart args
     try:
         fn = getattr(_faker, faker_fn)
         if faker_fn == "random_element":
             return fn(elements=["Male", "Female", "Non-binary"])
-        elif faker_fn in ("pyfloat", "random_int"):
-            return str(fn(min_value=0, max_value=99999))
-        return str(fn())
+        if faker_fn == "random_int":
+            mn = int(profile.get("min_val", 0))
+            mx = int(profile.get("max_val", 99999))
+            return fn(min=mn, max=max(mn + 1, mx))
+        if faker_fn == "pyfloat":
+            mn_f = float(profile.get("min_val", 0.0))
+            mx_f = float(profile.get("max_val", 99999.0))
+            return round(fn(min_value=mn_f, max_value=mx_f), 2)
+        if faker_fn in ("date_of_birth",):
+            return fn(minimum_age=18, maximum_age=90).strftime("%Y-%m-%d")
+        if faker_fn == "date_this_decade":
+            return fn().strftime("%Y-%m-%d")
+        if faker_fn == "date":
+            fmt = profile.get("date_fmt", "%Y-%m-%d")
+            return fn(pattern=fmt)
+        if faker_fn == "date_time_this_decade":
+            return str(fn())
+        if faker_fn == "bothify":
+            return fn(text="??###")
+        if faker_fn == "boolean":
+            return fn()
+        if faker_fn == "zipcode":
+            return fn()
+        return fn()
     except Exception:
-        return str(_faker.word())
+        return _faker.word()
 
-def build_faker_prompt(columns: list[str]) -> str:
-    return f"""You are a data generation assistant. Given a list of database column names, assign the most appropriate Faker library method name for generating fake data for each column.
+def build_faker_prompt(col_samples: dict) -> str:
+    """Build AI prompt with column names AND sample values for better mapping."""
+    samples_str = json.dumps(col_samples, indent=2, default=str)
+    return f"""You are a data generation assistant. Given column names and sample values from a database table, assign the most appropriate Faker library method for each column.
 
-Available Faker methods include: name, first_name, last_name, email, phone_number, ssn, address, street_address, city, state, zipcode, country, company, user_name, password, ipv4, url, date_of_birth, date, credit_card_number, iban, bban, text, sentence, uuid4, job, latitude, longitude, random_int, pyfloat, word.
+Available Faker methods: name, first_name, last_name, email, phone_number, ssn, address, street_address, city, state_abbr, zipcode, country, company, user_name, password, ipv4, ipv6, url, date_of_birth, date_this_decade, date_time_this_decade, credit_card_number, iban, bban, text, sentence, uuid4, job, latitude, longitude, random_int, pyfloat, boolean, color_name, currency_code, year, time, suffix, prefix, secondary_address, bothify, word.
 
 Rules:
-- Return ONLY a JSON object where keys are column names and values are Faker method names.
-- Do NOT include explanations or markdown fences.
-- If a column is clearly a numeric ID or primary key, use "random_int".
-- If unsure, use "word".
+- Return ONLY a JSON object: keys = column names, values = Faker method names from the list above.
+- No markdown fences, no explanation.
+- Use sample values to understand the data shape (e.g. 2-letter state codes → state_abbr, Y/N → random_element).
+- For numeric ID/PK columns use random_int.
+- For columns with only a few distinct values (like status flags), use random_element.
+- If truly unsure, use word.
 
-Columns: {json.dumps(columns)}
+Column samples (name: [sample values]):
+{samples_str}
 
-Response (JSON object only):"""
+Response (JSON only):"""
 
 def ai_map_faker_columns(columns: list[str], ai_engine: str,
+                          df_sample: pd.DataFrame = None,
                           ollama_url=None, ollama_model=None, ollama_timeout=180,
                           sf_conn=None, cortex_model=None) -> dict[str, str]:
-    """Use AI to map column names to Faker method names. Falls back to keyword matching."""
-    prompt = build_faker_prompt(columns)
+    """Map column names to Faker methods using AI + sample values. Falls back to keyword matching."""
+    # Build sample dict for the prompt
+    col_samples = {}
+    if df_sample is not None and not df_sample.empty:
+        for col in columns:
+            col_samples[col] = df_sample[col].dropna().astype(str).head(5).tolist()
+    else:
+        col_samples = {col: [] for col in columns}
+
+    prompt = build_faker_prompt(col_samples)
     raw = ""
     try:
         if ai_engine == "Ollama (LLaMA)" and ollama_url and ollama_model:
@@ -159,7 +307,7 @@ def ai_map_faker_columns(columns: list[str], ai_engine: str,
                     "model": ollama_model,
                     "messages": [{"role": "user", "content": prompt}],
                     "stream": False,
-                    "options": {"temperature": 0, "num_predict": 512},
+                    "options": {"temperature": 0, "num_predict": 1024},
                 },
                 timeout=ollama_timeout,
             )
@@ -175,36 +323,49 @@ def ai_map_faker_columns(columns: list[str], ai_engine: str,
         raw = re.sub(r"^```(?:json)?|```$", "", raw, flags=re.MULTILINE).strip()
         result = json.loads(raw)
         if isinstance(result, dict):
-            # Validate each value is a real Faker method, fallback if not
             mapped = {}
             for col in columns:
                 fn = result.get(col, guess_faker_type(col))
-                if not hasattr(_faker, fn):
+                if fn != "__passthrough__" and not hasattr(_faker, fn):
                     fn = guess_faker_type(col)
                 mapped[col] = fn
             return mapped
     except Exception:
         pass
-    # Full fallback: keyword-based mapping
     return {col: guess_faker_type(col) for col in columns}
 
 def generate_fake_dataframe(columns: list[str], faker_map: dict[str, str],
-                              dtypes: dict, n_rows: int) -> pd.DataFrame:
-    """Generate a DataFrame of n_rows fake values using the given faker_map."""
+                              df_original: pd.DataFrame, n_rows: int) -> pd.DataFrame:
+    """Generate n_rows of realistic fake data respecting original dtypes and value ranges."""
+    # Build per-column profiles from original data
+    profiles = {}
+    for col in columns:
+        if df_original is not None and col in df_original.columns and not df_original[col].dropna().empty:
+            profiles[col] = _profile_column(df_original[col])
+        else:
+            profiles[col] = {"dtype_str": "object", "nullable": False, "null_rate": 0.0}
+
     data = {}
     for col in columns:
-        fn = faker_map.get(col, "word")
-        values = [generate_fake_value(fn) for _ in range(n_rows)]
-        # Attempt to cast back to original dtype
+        fn      = faker_map.get(col, "__passthrough__")
+        profile = profiles[col]
+        values  = [_generate_typed_value(fn, profile) for _ in range(n_rows)]
+
+        # Cast to original dtype where possible
+        dtype_str = profile.get("dtype_str", "")
         try:
-            dtype = dtypes.get(col)
-            if dtype and "int" in str(dtype):
-                values = [int(re.sub(r"[^0-9]", "", str(v)) or 0) for v in values]
-            elif dtype and "float" in str(dtype):
-                values = [float(re.sub(r"[^0-9.]", "", str(v)) or 0.0) for v in values]
+            if "int" in dtype_str and not profile.get("nullable"):
+                values = pd.array(values, dtype=dtype_str)
+            elif "float" in dtype_str:
+                values = pd.array(values, dtype=dtype_str)
+            elif "bool" in dtype_str:
+                values = [bool(v) if v is not None else None for v in values]
+            elif "datetime" in dtype_str:
+                values = pd.to_datetime(values, errors="coerce")
         except Exception:
             pass
         data[col] = values
+
     return pd.DataFrame(data)
 
 # ─── Ollama ───────────────────────────────────────────────────────────────────
@@ -735,9 +896,10 @@ if st.session_state.connection and st.session_state.tables:
             # Default row count = actual table row count
             st.session_state.fake_row_overrides[table] = len(df2)
 
-            # AI column mapping
+            # AI column mapping — pass sample values for better accuracy
             fmap = ai_map_faker_columns(
                 list(df2.columns), _fai_engine2,
+                df_sample=df2,
                 ollama_url=ollama_url, ollama_model=ollama_model,
                 ollama_timeout=int(ollama_timeout),
                 sf_conn=_fai_sf_conn2, cortex_model=cortex_model,
@@ -891,8 +1053,7 @@ if st.session_state.faker_mapped and st.session_state.faker_maps:
             n_rows = st.session_state.fake_row_overrides.get(table, len(df_t))
             if not fmap:
                 continue
-            dtypes  = {c: df_t[c].dtype for c in df_t.columns}
-            fake_df = generate_fake_dataframe(list(df_t.columns), fmap, dtypes, int(n_rows))
+            fake_df = generate_fake_dataframe(list(df_t.columns), fmap, df_t, int(n_rows))
             if fake_mode == "Append fake rows to existing data" and not df_t.empty:
                 result_df = pd.concat([df_t, fake_df], ignore_index=True)
             else:
@@ -988,26 +1149,3 @@ if _has_output and _output_type:
 elif st.session_state.connection is None:
     st.info("👈 Select a data source in the sidebar and click Connect to begin.")
 
-# ─── Setup instructions ───────────────────────────────────────────────────────
-
-#with st.expander("ℹ️ Setup & prerequisites"):
-#    st.markdown("""
-#**Install packages:**
-#```bash
-#pip install streamlit pandas snowflake-connector-python requests pyodbc sqlalchemy faker
-#```
-
-#**Ollama setup:**
-#```bash
-#ollama pull llama3
-#ollama serve   # runs on http://localhost:11434
-#```
-
-#**Masking rules:**
-
-#| Value length | Example | Masked |
-#|---|---|---|
-#| ≤ 4 chars | `John` | `****` |
-#| 5–10 chars | `john@x.co` | `j*******o` |
-#| > 10 chars | `john@email.com` | `jo**********om` |
-#""")
