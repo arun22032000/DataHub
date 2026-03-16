@@ -6,10 +6,77 @@ import json
 import zipfile
 import requests
 import pyodbc
+import hashlib
+import hmac
 from faker import Faker
 from faker.providers import internet, person, address, phone_number, company, date_time, bank, misc
 from sqlalchemy import create_engine, inspect, text
 from snowflake.connector import connect
+
+
+# ─── Auth configuration ───────────────────────────────────────────────────────
+# Add or remove users here. Passwords are SHA-256 hashed.
+# To generate a hash: python -c "import hashlib; print(hashlib.sha256(b'yourpassword').hexdigest())"
+
+def _hash(password: str) -> str:
+    return hashlib.sha256(password.encode()).hexdigest()
+
+USER_DB = {
+    "admin":   _hash("Ar#9598#Ar"),
+    "analyst": _hash("analyst@2024"),
+    "viewer":  _hash("view#only1"),
+    "p.a.sivakumar": _hash("pas001")
+}
+
+ROLE_LABELS = {
+    "admin":   "Administrator",
+    "analyst": "Data Analyst",
+    "viewer":  "Viewer",
+    "user":    "User01"
+}
+
+def _check_credentials(username: str, password: str) -> bool:
+    expected = USER_DB.get(username.strip().lower())
+    if not expected:
+        return False
+    return hmac.compare_digest(expected, _hash(password))
+
+def _render_login():
+    """Render the login page. Returns True if authenticated."""
+    # Centre-column layout
+    _, mid, _ = st.columns([1.5, 2, 1.5])
+    with mid:
+        st.markdown("<br><br>", unsafe_allow_html=True)
+        st.image("https://img.icons8.com/fluency/96/shield.png", width=72)
+        st.markdown("## 🛡️ Database PII Shield")
+        st.markdown("##### Please log in to continue")
+        st.markdown("<br>", unsafe_allow_html=True)
+
+        with st.form("login_form", clear_on_submit=False):
+            username = st.text_input("Username", placeholder="Enter your username")
+            password = st.text_input("Password", type="password", placeholder="Enter your password")
+            submitted = st.form_submit_button("Log In", use_container_width=True, type="primary")
+
+            if submitted:
+                if not username or not password:
+                    st.error("Please enter both username and password.")
+                elif _check_credentials(username, password):
+                    st.session_state["authenticated"] = True
+                    st.session_state["current_user"]  = username.strip().lower()
+                    st.rerun()
+                else:
+                    st.error("❌ Invalid username or password.")
+
+        st.markdown("<br>", unsafe_allow_html=True)
+        st.caption("Contact your administrator to request access.")
+    return st.session_state.get("authenticated", False)
+
+# ─── Auth gate ────────────────────────────────────────────────────────────────
+
+if not st.session_state.get("authenticated", False):
+    st.set_page_config(page_title="PII Shield — Login", layout="centered")
+    _render_login()
+    st.stop()
 
 st.set_page_config(page_title="PII Data Masker", layout="wide")
 st.title("🛡️ Database PII Shield")
@@ -553,6 +620,22 @@ def sqlserver_create_clone_db(engine, tgt_db: str, table_masked_map: dict):
 # ─── Sidebar ──────────────────────────────────────────────────────────────────
 
 with st.sidebar:
+    # ── User info & logout ────────────────────────────────────────────────────
+    current_user = st.session_state.get("current_user", "")
+    role_label   = ROLE_LABELS.get(current_user, current_user.capitalize())
+    st.markdown(
+        f"<div style='padding:8px 0 4px 0'>"
+        f"<span style='font-size:18px'>👤</span> "
+        f"<b>{current_user}</b> "
+        f"<span style='color:#7FA2C8;font-size:12px'>({role_label})</span>"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+    if st.button("🚪 Log Out", use_container_width=True):
+        for key in list(st.session_state.keys()):
+            del st.session_state[key]
+        st.rerun()
+    st.divider()
     st.header("1. Data Source")
     source_type = st.radio("Select data source",
                            ["Snowflake", "SQL Server", "CSV Upload"])
