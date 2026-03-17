@@ -83,7 +83,7 @@ if not st.session_state.get("authenticated", False):
 
 st.set_page_config(page_title="IntelliClone", layout="wide")
 st.title("🛡️ IntelliClone")
-st.markdown("Connect to a data source, auto-detect PII columns with AI, review, then mask or clone with demo data.")
+st.markdown("Connect to a data source, auto-detect PII columns with Ollama, review, then mask or clone with demo data.")
 
 # ─── Regex patterns ───────────────────────────────────────────────────────────
 
@@ -660,18 +660,44 @@ def sqlserver_fetch_tables(engine):
 def sqlserver_fetch_data(engine, table, limit):
     return pd.read_sql(f"SELECT TOP {limit} * FROM [{table}]", engine)
 
-def sqlserver_create_clone_db(engine, tgt_db: str, table_masked_map: dict):
-    """Create a new SQL Server database and write masked tables into it."""
-    results = {}
-    with engine.connect() as con:
-        con.execute(text("COMMIT"))
-        try:
-            con.execute(text(f"IF DB_ID('{tgt_db}') IS NULL CREATE DATABASE [{tgt_db}]"))
-        except Exception as e:
-            return {t: f"❌ Could not create DB: {e}" for t in table_masked_map}
+def sqlserver_create_clone_db(engine, tgt_db: str, table_masked_map: dict,
+                               sql_params: dict = None):
+    """Create a new SQL Server database and write masked tables into it.
 
-    tgt_url = str(engine.url).rsplit("/", 1)[0] + f"/{tgt_db}"
-    tgt_engine = create_engine(tgt_url)
+    sql_params: dict with keys server, username, password, driver, port,
+                conn_timeout, is_azure — used to build a clean target engine.
+                If omitted, falls back to writing into the source DB (safe for demos).
+    """
+    results = {}
+
+    # Step 1: Create the target DB on the source connection
+    try:
+        with engine.connect() as con:
+            con.execute(text("COMMIT"))
+            con.execute(text(f"IF DB_ID(N'{tgt_db}') IS NULL CREATE DATABASE [{tgt_db}]"))
+    except Exception as e:
+        return {t: f"❌ Could not create DB [{tgt_db}]: {e}" for t in table_masked_map}
+
+    # Step 2: Build a new engine pointing at the target DB
+    try:
+        if sql_params:
+            tgt_engine = get_sqlserver_engine(
+                server       = sql_params["server"],
+                database     = tgt_db,
+                username     = sql_params.get("username", ""),
+                password     = sql_params.get("password", ""),
+                driver       = sql_params.get("driver", "ODBC Driver 17 for SQL Server"),
+                port         = sql_params.get("port", 1433),
+                conn_timeout = sql_params.get("conn_timeout", 30),
+                is_azure     = sql_params.get("is_azure", False),
+            )
+        else:
+            # Fallback: reuse source engine (writes to source DB — tables still isolated)
+            tgt_engine = engine
+    except Exception as e:
+        return {t: f"❌ Could not connect to target DB: {e}" for t in table_masked_map}
+
+    # Step 3: Write tables
     for table_name, masked_df in table_masked_map.items():
         try:
             masked_df.to_sql(table_name, tgt_engine, if_exists="replace", index=False)
@@ -856,7 +882,12 @@ if connect_btn:
                     port=int(sql_port), conn_timeout=int(sql_timeout), is_azure=sql_is_azure,
                 )
                 with engine.connect(): pass
-                st.session_state.connection = ("sqlserver", engine)
+                st.session_state.connection = ("sqlserver", engine, sql_database, {
+                    "server": sql_server, "username": sql_username,
+                    "password": sql_password, "driver": sql_driver,
+                    "port": int(sql_port), "conn_timeout": int(sql_timeout),
+                    "is_azure": sql_is_azure,
+                })
                 st.session_state.tables     = sqlserver_fetch_tables(engine)
                 st.success(f"Connected! Found {len(st.session_state.tables)} tables.")
             except Exception as e:
@@ -957,7 +988,7 @@ if st.session_state.connection and st.session_state.tables:
                         _, conn, db, sch = st.session_state.connection
                         df = snowflake_fetch_data(conn, db, sch, table, int(row_limit))
                     elif conn_type == "sqlserver":
-                        _, engine = st.session_state.connection
+                        _, engine, *_ = st.session_state.connection
                         df = sqlserver_fetch_data(engine, table, int(row_limit))
                     elif conn_type == "csv":
                         df = st.session_state.table_dfs.get(table, pd.DataFrame())
@@ -1062,7 +1093,7 @@ if st.session_state.connection and st.session_state.tables:
                     _, conn2, db2, sch2 = st.session_state.connection
                     df2 = snowflake_fetch_data(conn2, db2, sch2, table, int(row_limit))
                 elif conn_type2 == "sqlserver":
-                    _, engine2 = st.session_state.connection
+                    _, engine2, *_ = st.session_state.connection
                     df2 = sqlserver_fetch_data(engine2, table, int(row_limit))
                 elif conn_type2 == "csv":
                     df2 = st.session_state.table_dfs.get(table, pd.DataFrame())
@@ -1315,12 +1346,14 @@ if _has_output and _output_type:
                     for tbl, msg in results.items():
                         st.write(f"**{tbl}**: {msg}")
             elif conn_type == "sqlserver":
-                _, engine_w = st.session_state.connection
-                src_db = str(engine_w.url).rsplit("/", 1)[-1]
+                _, engine_w, src_db, sql_conn_params = st.session_state.connection
                 tgt_db = st.text_input("Target Database", value=f"{src_db}{_default_suffix}", key="tgt_db4_sql")
                 if st.button(f"🚀 Write {_label} to SQL Server", type="primary", key="write4_sql"):
                     with st.spinner("Writing to SQL Server..."):
-                        results = sqlserver_create_clone_db(engine_w, tgt_db, _export_dfs)
+                        results = sqlserver_create_clone_db(
+                            engine_w, tgt_db, _export_dfs,
+                            sql_params=sql_conn_params,
+                        )
                     for tbl, msg in results.items():
                         st.write(f"**{tbl}**: {msg}")
 
