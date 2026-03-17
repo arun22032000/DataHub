@@ -1156,14 +1156,14 @@ if st.session_state.faker_mapped and st.session_state.faker_maps:
             with st.expander(f"📋 **{table}** — {len(fdf):,} rows", expanded=False):
                 st.dataframe(fdf.head(20), use_container_width=True)
 
-# ─── Step 4: Export (masked OR fake, whichever was last generated) ────────────
+# ─── Step 4: Export (masked OR demo, whichever was last generated) ────────────
 
 _has_output = bool(st.session_state.table_masked_dfs or st.session_state.faker_dfs)
 _output_type = st.session_state.get("active_output")  # "masked" or "fake"
 
 if _has_output and _output_type:
     st.divider()
-    _label = "Masked Data" if _output_type == "masked" else "Fake Data"
+    _label = "Masked Data" if _output_type == "masked" else "Demo Data"
     _export_dfs = st.session_state.table_masked_dfs if _output_type == "masked" else st.session_state.faker_dfs
     _file_prefix = "masked" if _output_type == "masked" else "demo"
     _zip_name    = "masked_tables.zip" if _output_type == "masked" else "demo_tables.zip"
