@@ -25,14 +25,16 @@ USER_DB = {
     "admin":   _hash("Ar#9598#Ar"),
     "analyst": _hash("analyst@2024"),
     "viewer":  _hash("view#only1"),
-    "p.a.sivakumar": _hash("pas001")
+    "p.a.sivakumar": _hash("pas001"),
+    "santhosh.shasthri": _hash("ss001")
 }
 
 ROLE_LABELS = {
     "admin":   "Administrator",
     "analyst": "Data Analyst",
     "viewer":  "Viewer",
-    "user":    "User01"
+    "user":    "User01",
+    "user":    "User02"
 }
 
 def _check_credentials(username: str, password: str) -> bool:
