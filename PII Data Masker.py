@@ -50,7 +50,7 @@ def _render_login():
     with mid:
         st.markdown("<br><br>", unsafe_allow_html=True)
         st.image("https://img.icons8.com/fluency/96/shield.png", width=72)
-        st.markdown("## 🛡️ Database PII Shield")
+        st.markdown("## 🛡️ IntelliClone")
         st.markdown("##### Please log in to continue")
         st.markdown("<br>", unsafe_allow_html=True)
 
@@ -76,12 +76,12 @@ def _render_login():
 # ─── Auth gate ────────────────────────────────────────────────────────────────
 
 if not st.session_state.get("authenticated", False):
-    st.set_page_config(page_title="PII Shield — Login", layout="centered")
+    st.set_page_config(page_title="IntelliClone — Login", layout="centered")
     _render_login()
     st.stop()
 
-st.set_page_config(page_title="PII Data Masker", layout="wide")
-st.title("🛡️ Database PII Shield")
+st.set_page_config(page_title="IntelliClone", layout="wide")
+st.title("🛡️ IntelliClone")
 st.markdown("Connect to a data source, auto-detect PII columns with Ollama, review, then mask.")
 
 # ─── Regex patterns ───────────────────────────────────────────────────────────
@@ -832,7 +832,7 @@ if st.session_state.connection and st.session_state.tables:
         )
     with btn_col2:
         fetch_fake_btn = st.button(
-            f"🎭 Fetch & Generate Fake Data — {len(st.session_state.selected_tables)} table(s)",
+            f"🎭 Fetch & Generate Demo Data — {len(st.session_state.selected_tables)} table(s)",
             type="primary",
             disabled=not st.session_state.selected_tables,
             use_container_width=True,
@@ -931,7 +931,7 @@ if st.session_state.connection and st.session_state.tables:
         st.session_state.active_output  = "masked"
         st.rerun()
 
-    # ── Fetch & Generate Fake Data ────────────────────────────────────────────
+    # ── Fetch & Generate Demo Data ────────────────────────────────────────────
     if fetch_fake_btn:
         # Preserve pre-loaded CSV data
         _saved_csv_dfs2 = {
@@ -1014,7 +1014,7 @@ if st.session_state.detection_done and st.session_state.table_pii_cols:
         with st.expander(
             f"📋 **{table}** — {len(detected)} PII column(s) detected  "
             f"| {len(df):,} rows × {len(df.columns)} cols",
-            expanded=True,
+            expanded=False,
         ):
             # Widget key drives pre-selection (set during detection); read back after user edits
             final_cols = st.multiselect(
@@ -1057,7 +1057,7 @@ if st.session_state.detection_done and st.session_state.table_pii_cols:
 
 if st.session_state.faker_mapped and st.session_state.faker_maps:
     st.divider()
-    st.header("Step 3 — Review & Generate Fake Data")
+    st.header("Step 3 — Review & Generate Demo Data")
     st.markdown(
         "AI has mapped each column to a Faker method. "
         "**Edit mappings** and set **row counts per table**, then click Generate."
@@ -1068,10 +1068,10 @@ if st.session_state.faker_mapped and st.session_state.faker_maps:
     with g1:
         fake_mode = st.radio(
             "Generation mode",
-            ["Replace all data with fake data", "Append fake rows to existing data"],
+            ["Replace all data with demo data", "Append demo rows to existing data"],
             key="fake_mode_radio",
             horizontal=True,
-            help="Replace: discard originals entirely. Append: add fake rows below original data.",
+            help="Replace: discard originals entirely. Append: add demo rows below original data.",
         )
     with g2:
         st.caption("Per-table row counts are set inside each table expander below.")
@@ -1095,7 +1095,7 @@ if st.session_state.faker_mapped and st.session_state.faker_maps:
 
         with st.expander(
             f"📋 **{table}** — {len(fmap)} columns | original {len(df_t):,} rows",
-            expanded=True,
+            expanded=False,
         ):
             # Per-table row count control
             rc_col, _ = st.columns([2, 4])
@@ -1128,7 +1128,7 @@ if st.session_state.faker_mapped and st.session_state.faker_maps:
         st.session_state.faker_maps[table] = fmap
 
     st.divider()
-    if st.button("✨ Generate Fake Data for All Tables", type="primary", key="faker_gen_btn"):
+    if st.button("✨ Generate Demo Data for All Tables", type="primary", key="faker_gen_btn"):
         st.session_state.faker_dfs = {}
         gen_prog = st.progress(0, text="Generating...")
         tables_list = st.session_state.selected_tables
@@ -1151,7 +1151,7 @@ if st.session_state.faker_mapped and st.session_state.faker_maps:
 
     # Preview
     if st.session_state.faker_dfs:
-        st.subheader("Preview Generated Fake Data")
+        st.subheader("Preview Generated Demo Data")
         for table, fdf in st.session_state.faker_dfs.items():
             with st.expander(f"📋 **{table}** — {len(fdf):,} rows", expanded=False):
                 st.dataframe(fdf.head(20), use_container_width=True)
@@ -1165,8 +1165,8 @@ if _has_output and _output_type:
     st.divider()
     _label = "Masked Data" if _output_type == "masked" else "Fake Data"
     _export_dfs = st.session_state.table_masked_dfs if _output_type == "masked" else st.session_state.faker_dfs
-    _file_prefix = "masked" if _output_type == "masked" else "fake"
-    _zip_name    = "masked_tables.zip" if _output_type == "masked" else "fake_tables.zip"
+    _file_prefix = "masked" if _output_type == "masked" else "demo"
+    _zip_name    = "masked_tables.zip" if _output_type == "masked" else "demo_tables.zip"
 
     st.header(f"Step 4 — Export {_label}")
     conn_type = st.session_state.connection[0] if st.session_state.connection else "csv"
@@ -1211,7 +1211,7 @@ if _has_output and _output_type:
                 f"Write all {_label.lower()} into a **new database/schema** on the same server, "
                 "leaving the original data untouched."
             )
-            _default_suffix = "_MASKED" if _output_type == "masked" else "_FAKE"
+            _default_suffix = "_MASKED" if _output_type == "masked" else "_DEMO"
             if conn_type == "snowflake":
                 _, conn_w, src_db, src_schema = st.session_state.connection
                 c1, c2 = st.columns(2)
