@@ -8,6 +8,7 @@ import requests
 import pyodbc
 import hashlib
 import hmac
+from urllib.parse import quote_plus
 from faker import Faker
 from faker.providers import internet, person, address, phone_number, company, date_time, bank, misc
 from sqlalchemy import create_engine, inspect, text
@@ -22,19 +23,15 @@ def _hash(password: str) -> str:
     return hashlib.sha256(password.encode()).hexdigest()
 
 USER_DB = {
-    "admin":   _hash("Ar#9598#Ar"),
+    "admin":   _hash("admin123"),
     "analyst": _hash("analyst@2024"),
     "viewer":  _hash("view#only1"),
-    "p.a.sivakumar": _hash("pas001"),
-    "santhosh.shasthri": _hash("ss001")
 }
 
 ROLE_LABELS = {
     "admin":   "Administrator",
     "analyst": "Data Analyst",
     "viewer":  "Viewer",
-    "user":    "User01",
-    "user":    "User02"
 }
 
 def _check_credentials(username: str, password: str) -> bool:
@@ -49,8 +46,9 @@ def _render_login():
     _, mid, _ = st.columns([1.5, 2, 1.5])
     with mid:
         st.markdown("<br><br>", unsafe_allow_html=True)
-        st.image("https://img.icons8.com/fluency/96/shield.png", width=72)
-        st.markdown("## 🛡️ IntelliClone")
+        st.image("https://img.icons8.com/fluency/96/dna.png", width=72)
+        st.markdown("## 🧬 IntelliClone")
+        st.markdown("##### Intelligent Data Masking & Demo Data Generation")
         st.markdown("###### Please log in to continue")
         st.markdown("<br>", unsafe_allow_html=True)
 
@@ -81,7 +79,7 @@ if not st.session_state.get("authenticated", False):
     st.stop()
 
 st.set_page_config(page_title="IntelliClone", layout="wide")
-st.title("🛡️ IntelliClone")
+st.title("🧬 IntelliClone")
 st.markdown("Connect to a data source, auto-detect PII columns with Ollama, review, then mask or clone with demo data.")
 
 # ─── Regex patterns ───────────────────────────────────────────────────────────
@@ -584,14 +582,38 @@ def snowflake_create_clone_schema(conn, src_db, src_schema, tgt_db, tgt_schema,
     return results
 
 @st.cache_resource
-def get_sqlserver_engine(server, database, username, password, driver):
-    if username and password:
-        conn_str = (f"mssql+pyodbc://{username}:{password}@{server}/{database}"
-                    f"?driver={driver.replace(' ', '+')}")
+def get_sqlserver_engine(server, database, username, password, driver,
+                          port=1433, conn_timeout=30, is_azure=False):
+    """Build a SQLAlchemy engine for SQL Server / Azure SQL.
+
+    Azure SQL requires Encrypt=yes and does not support Windows auth.
+    Special characters in passwords are percent-encoded to avoid parse errors.
+    """
+    driver_enc = driver.replace(" ", "+")
+    # Base ODBC params
+    odbc_params = (
+        f"DRIVER={{{driver}}};"
+        f"SERVER={server},{port};"
+        f"DATABASE={database};"
+        f"Connection Timeout={conn_timeout};"
+    )
+    if is_azure or any(x in server.lower() for x in
+                       ("database.windows.net", "database.azure.com", ".database.")):
+        # Azure SQL — always encrypted, no Windows auth
+        odbc_params += "Encrypt=yes;TrustServerCertificate=no;"
+        if username and password:
+            odbc_params += f"UID={username};PWD={password};"
+        conn_str = f"mssql+pyodbc:///?odbc_connect={quote_plus(odbc_params)}"
+    elif username and password:
+        # On-premise with SQL auth — encode password to handle special chars
+        odbc_params += f"UID={username};PWD={password};Encrypt=no;"
+        conn_str = f"mssql+pyodbc:///?odbc_connect={quote_plus(odbc_params)}"
     else:
-        conn_str = (f"mssql+pyodbc://@{server}/{database}"
-                    f"?driver={driver.replace(' ', '+')}&trusted_connection=yes")
-    return create_engine(conn_str)
+        # On-premise Windows auth
+        odbc_params += "Trusted_Connection=yes;"
+        conn_str = f"mssql+pyodbc:///?odbc_connect={quote_plus(odbc_params)}"
+
+    return create_engine(conn_str, connect_args={"timeout": conn_timeout})
 
 def sqlserver_fetch_tables(engine):
     return inspect(engine).get_table_names()
@@ -762,7 +784,10 @@ if connect_btn:
     elif source_type == "SQL Server":
         with st.spinner("Connecting to SQL Server..."):
             try:
-                engine = get_sqlserver_engine(sql_server, sql_database, sql_username, sql_password, sql_driver)
+                engine = get_sqlserver_engine(
+                    sql_server, sql_database, sql_username, sql_password, sql_driver,
+                    port=int(sql_port), conn_timeout=int(sql_timeout), is_azure=sql_is_azure,
+                )
                 with engine.connect(): pass
                 st.session_state.connection = ("sqlserver", engine)
                 st.session_state.tables     = sqlserver_fetch_tables(engine)
