@@ -659,7 +659,7 @@ with st.sidebar:
         sql_database = st.text_input("Database")
         sql_username = st.text_input("Username (blank = Windows auth)")
         sql_password = st.text_input("Password", type="password")
-        available_drivers = [d for d in pyodbc.drivers() if "SQL Server" in d] or ["ODBC Driver 17 for SQL Server"]
+        available_drivers = [d for d in pyodbc.drivers() if "SQL Server" in d] or ["ODBC Driver 18 for SQL Server"]
         sql_driver   = st.selectbox("ODBC Driver", available_drivers)
 
     elif source_type == "CSV Upload":
