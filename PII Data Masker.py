@@ -49,9 +49,8 @@ def _render_login():
     _, mid, _ = st.columns([1.5, 2, 1.5])
     with mid:
         st.markdown("<br><br>", unsafe_allow_html=True)
-        st.image("https://img.icons8.com/fluency/96/dna.png", width=72)
-        st.markdown("## 🧬 IntelliClone")
-        st.markdown("##### Intelligent Data Masking & Demo Data Generation")
+        st.image("https://img.icons8.com/fluency/96/shield.png", width=72)
+        st.markdown("## 🛡️ IntelliClone")
         st.markdown("###### Please log in to continue")
         st.markdown("<br>", unsafe_allow_html=True)
 
@@ -82,7 +81,7 @@ if not st.session_state.get("authenticated", False):
     st.stop()
 
 st.set_page_config(page_title="IntelliClone", layout="wide")
-st.title("🧬 IntelliClone")
+st.title("🛡️ IntelliClone")
 st.markdown("Connect to a data source, auto-detect PII columns with Ollama, review, then mask or clone with demo data.")
 
 # ─── Regex patterns ───────────────────────────────────────────────────────────
