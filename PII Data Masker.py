@@ -664,21 +664,45 @@ def sqlserver_create_clone_db(engine, tgt_db: str, table_masked_map: dict,
                                sql_params: dict = None):
     """Create a new SQL Server database and write masked tables into it.
 
-    sql_params: dict with keys server, username, password, driver, port,
-                conn_timeout, is_azure — used to build a clean target engine.
-                If omitted, falls back to writing into the source DB (safe for demos).
+    CREATE DATABASE must run outside any transaction (autocommit=True).
+    We use a raw pyodbc connection for that step, then a fresh SQLAlchemy
+    engine for the actual table writes.
     """
     results = {}
 
-    # Step 1: Create the target DB on the source connection
+    # Step 1: Create the target DB using a raw pyodbc autocommit connection
+    # so that CREATE DATABASE never runs inside a transaction.
     try:
-        with engine.connect() as con:
-            con.execute(text("COMMIT"))
-            con.execute(text(f"IF DB_ID(N'{tgt_db}') IS NULL CREATE DATABASE [{tgt_db}]"))
+        p = sql_params or {}
+        driver       = p.get("driver", "ODBC Driver 17 for SQL Server")
+        server       = p.get("server", "")
+        port         = p.get("port", 1433)
+        username     = p.get("username", "")
+        password     = p.get("password", "")
+        is_azure     = p.get("is_azure", False)
+        conn_timeout = p.get("conn_timeout", 30)
+
+        odbc_str = (
+            f"DRIVER={{{driver}}};"
+            f"SERVER={server},{port};"
+            f"DATABASE=master;"          # connect to master to create a new DB
+            f"Connection Timeout={conn_timeout};"
+        )
+        if is_azure or "database.windows.net" in server.lower():
+            odbc_str += "Encrypt=yes;TrustServerCertificate=no;"
+        if username and password:
+            odbc_str += f"UID={username};PWD={password};"
+        else:
+            odbc_str += "Trusted_Connection=yes;"
+
+        raw_conn = pyodbc.connect(odbc_str, autocommit=True)
+        cur = raw_conn.cursor()
+        cur.execute(f"IF DB_ID(N'{tgt_db}') IS NULL CREATE DATABASE [{tgt_db}]")
+        raw_conn.close()
     except Exception as e:
         return {t: f"❌ Could not create DB [{tgt_db}]: {e}" for t in table_masked_map}
 
-    # Step 2: Build a new engine pointing at the target DB
+    # Step 2: Build a fresh SQLAlchemy engine pointing at the new target DB
     try:
         if sql_params:
             tgt_engine = get_sqlserver_engine(
@@ -692,12 +716,11 @@ def sqlserver_create_clone_db(engine, tgt_db: str, table_masked_map: dict,
                 is_azure     = sql_params.get("is_azure", False),
             )
         else:
-            # Fallback: reuse source engine (writes to source DB — tables still isolated)
             tgt_engine = engine
     except Exception as e:
-        return {t: f"❌ Could not connect to target DB: {e}" for t in table_masked_map}
+        return {t: f"❌ Could not connect to target DB [{tgt_db}]: {e}" for t in table_masked_map}
 
-    # Step 3: Write tables
+    # Step 3: Write each table
     for table_name, masked_df in table_masked_map.items():
         try:
             masked_df.to_sql(table_name, tgt_engine, if_exists="replace", index=False)
