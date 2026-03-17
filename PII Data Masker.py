@@ -677,12 +677,24 @@ with st.sidebar:
 
     elif source_type == "SQL Server":
         st.subheader("SQL Server Connection")
-        sql_server   = st.text_input("Server", placeholder="localhost\\SQLEXPRESS")
+        sql_server   = st.text_input("Server", placeholder="myserver.database.windows.net")
         sql_database = st.text_input("Database")
-        sql_username = st.text_input("Username (blank = Windows auth)")
+        sql_username = st.text_input("Username", placeholder="user or user@server")
         sql_password = st.text_input("Password", type="password")
         available_drivers = [d for d in pyodbc.drivers() if "SQL Server" in d] or ["ODBC Driver 17 for SQL Server"]
         sql_driver   = st.selectbox("ODBC Driver", available_drivers)
+        _is_azure_default = any(x in sql_server.lower() for x in
+                                ("database.windows.net", "database.azure.com", ".database."))
+        sql_c1, sql_c2 = st.columns(2)
+        with sql_c1:
+            sql_port    = st.number_input("Port", value=1433, min_value=1, max_value=65535)
+        with sql_c2:
+            sql_timeout = st.number_input("Timeout (s)", value=30, min_value=5, max_value=120)
+        sql_is_azure = st.toggle("Azure SQL / Azure Managed Instance",
+                                  value=_is_azure_default,
+                                  help="Enables Encrypt=yes and TrustServerCertificate=no required by Azure SQL.")
+        if sql_is_azure:
+            st.info("🔒 Azure SQL mode: encrypted connection enabled automatically.")
 
     elif source_type == "CSV Upload":
         st.subheader("CSV Upload")
@@ -731,6 +743,13 @@ with st.sidebar:
     st.divider()
     st.subheader("3. Fetch Settings")
     row_limit = st.number_input("Row limit per table", min_value=1, max_value=100_000, value=500)
+
+    # Safe defaults — ensure sql_* vars are always defined regardless of source_type
+    if source_type != "SQL Server":
+        sql_server = sql_database = sql_username = sql_password = sql_driver = ""
+        sql_port = 1433
+        sql_timeout = 30
+        sql_is_azure = False
 
     connect_btn = st.button(
         "Connect" if source_type != "CSV Upload" else "Load Files",
