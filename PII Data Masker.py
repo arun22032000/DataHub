@@ -83,7 +83,7 @@ if not st.session_state.get("authenticated", False):
 
 st.set_page_config(page_title="IntelliClone", layout="wide")
 st.title("🛡️ IntelliClone")
-st.markdown("Connect to a data source, auto-detect PII columns with Ollama, review, then mask or clone with demo data.")
+st.markdown("Connect to a data source, auto-detect PII columns with AI, review, then mask or clone with demo data.")
 
 # ─── Regex patterns ───────────────────────────────────────────────────────────
 
@@ -545,21 +545,57 @@ def regex_detect_pii_columns(df: pd.DataFrame) -> list[str]:
 
 # ─── Data sources ─────────────────────────────────────────────────────────────
 
-@st.cache_resource
+def _make_snowflake_conn(account, user, password, warehouse, database, schema, role):
+    """Always creates a fresh Snowflake connection (never cached)."""
+    return connect(
+        account=account, user=user, password=password,
+        warehouse=warehouse, database=database, schema=schema,
+        role=role or None,
+        login_timeout=30,
+        network_timeout=60,
+    )
+
+def _sf_conn_alive(conn) -> bool:
+    """Return True if the connection is still valid, False if expired/closed."""
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT 1")
+        cur.fetchone()
+        return True
+    except Exception:
+        return False
+
 def get_snowflake_conn(account, user, password, warehouse, database, schema, role):
-    return connect(account=account, user=user, password=password,
-                   warehouse=warehouse, database=database, schema=schema,
-                   role=role or None)
+    """Return a live Snowflake connection, refreshing if the token has expired."""
+    conn = st.session_state.get("_sf_raw_conn")
+    if conn is None or not _sf_conn_alive(conn):
+        conn = _make_snowflake_conn(account, user, password, warehouse, database, schema, role)
+        st.session_state["_sf_raw_conn"] = conn
+    return conn
+
+def _sf_execute(conn, sql, fetch="all"):
+    """Execute SQL on a Snowflake connection; converts token-expiry errors to a clear message."""
+    try:
+        cur = conn.cursor()
+        cur.execute(sql)
+        return cur.fetchall() if fetch == "all" else cur.fetch_pandas_all()
+    except Exception as e:
+        if "390114" in str(e) or "token" in str(e).lower() or "expired" in str(e).lower():
+            raise RuntimeError(
+                "🔑 Snowflake session expired. Please click Connect to refresh your session."
+            ) from e
+        raise
 
 def snowflake_fetch_tables(conn, database, schema):
-    cur = conn.cursor()
-    cur.execute(f"SHOW TABLES IN {database}.{schema}")
-    return [r[1] for r in cur.fetchall()]
+    rows = _sf_execute(conn, f"SHOW TABLES IN {database}.{schema}", fetch="all")
+    return [r[1] for r in rows]
 
 def snowflake_fetch_data(conn, database, schema, table, limit):
-    cur = conn.cursor()
-    cur.execute(f'SELECT * FROM "{database}"."{schema}"."{table}" LIMIT {limit}')
-    return cur.fetch_pandas_all()
+    return _sf_execute(
+        conn,
+        f'SELECT * FROM "{database}"."{schema}"."{table}" LIMIT {limit}',
+        fetch="pandas"
+    )
 
 def snowflake_create_clone_schema(conn, src_db, src_schema, tgt_db, tgt_schema,
                                    table_masked_map: dict):
@@ -794,6 +830,8 @@ if connect_btn:
 
     if source_type == "Snowflake":
         with st.spinner("Connecting to Snowflake..."):
+            # Clear any cached stale connection before attempting
+            st.session_state.pop("_sf_raw_conn", None)
             try:
                 conn = get_snowflake_conn(sf_account, sf_user, sf_password,
                                           sf_warehouse, sf_database, sf_schema, sf_role)
@@ -801,7 +839,14 @@ if connect_btn:
                 st.session_state.tables     = snowflake_fetch_tables(conn, sf_database, sf_schema)
                 st.success(f"Connected! Found {len(st.session_state.tables)} tables.")
             except Exception as e:
-                st.error(f"Snowflake connection failed: {e}")
+                err_str = str(e)
+                if "390114" in err_str or "token" in err_str.lower() or "expired" in err_str.lower():
+                    st.error(
+                        "🔑 Snowflake authentication token expired. "
+                        "Please click **Connect** again to start a fresh session."
+                    )
+                else:
+                    st.error(f"Snowflake connection failed: {e}")
 
     elif source_type == "SQL Server":
         with st.spinner("Connecting to SQL Server..."):
