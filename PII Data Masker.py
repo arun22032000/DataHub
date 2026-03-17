@@ -49,7 +49,7 @@ def _render_login():
     # Centre-column layout
     _, mid, _ = st.columns([1.5, 2, 1.5])
     with mid:
-        st.markdown("<br><br>", unsafe_allow_html=
+        st.markdown("<br><br>", unsafe_allow_html=True)
         st.image("https://img.icons8.com/fluency/96/shield.png", width=72)
         st.markdown("## 🛡️ IntelliClone")
         st.markdown("###### Please log in to continue")
