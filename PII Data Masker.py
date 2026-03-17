@@ -49,9 +49,10 @@ def _render_login():
     _, mid, _ = st.columns([1.5, 2, 1.5])
     with mid:
         st.markdown("<br><br>", unsafe_allow_html=True)
-        st.image("https://img.icons8.com/fluency/96/shield.png", width=72)
-        st.markdown("## 🛡️ IntelliClone")
-        st.markdown("##### Please log in to continue")
+        st.image("https://img.icons8.com/fluency/96/dna.png", width=72)
+        st.markdown("## 🧬 IntelliClone")
+        st.markdown("##### Intelligent Data Masking & Demo Data Generation")
+        st.markdown("###### Please log in to continue")
         st.markdown("<br>", unsafe_allow_html=True)
 
         with st.form("login_form", clear_on_submit=False):
@@ -81,8 +82,8 @@ if not st.session_state.get("authenticated", False):
     st.stop()
 
 st.set_page_config(page_title="IntelliClone", layout="wide")
-st.title("🛡️ IntelliClone")
-st.markdown("Connect to a data source, auto-detect PII columns with Ollama, review, then mask.")
+st.title("🧬 IntelliClone")
+st.markdown("Connect to a data source, auto-detect PII columns with Ollama, review, then mask or clone with demo data.")
 
 # ─── Regex patterns ───────────────────────────────────────────────────────────
 
@@ -659,7 +660,7 @@ with st.sidebar:
         sql_database = st.text_input("Database")
         sql_username = st.text_input("Username (blank = Windows auth)")
         sql_password = st.text_input("Password", type="password")
-        available_drivers = [d for d in pyodbc.drivers() if "SQL Server" in d] or ["ODBC Driver 18 for SQL Server"]
+        available_drivers = [d for d in pyodbc.drivers() if "SQL Server" in d] or ["ODBC Driver 17 for SQL Server"]
         sql_driver   = st.selectbox("ODBC Driver", available_drivers)
 
     elif source_type == "CSV Upload":
@@ -729,7 +730,7 @@ defaults = {
     "faker_dfs": {},          # {table: generated fake df}
     "faker_mode": "replace",  # "replace" or "append"
     "fake_row_overrides": {}, # {table: int}  per-table row counts
-    "active_output": None,    # "masked" or "fake" — drives Step 4
+    "active_output": None,    # "masked" or "demo" — drives Step 4
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -931,7 +932,7 @@ if st.session_state.connection and st.session_state.tables:
         st.session_state.active_output  = "masked"
         st.rerun()
 
-    # ── Fetch & Generate Demo Data ────────────────────────────────────────────
+    # ── Fetch & Generate Demo Data ─────────────────────────────────────────────
     if fetch_fake_btn:
         # Preserve pre-loaded CSV data
         _saved_csv_dfs2 = {
@@ -992,9 +993,9 @@ if st.session_state.connection and st.session_state.tables:
             )
             st.session_state.faker_maps[table] = fmap
 
-        fake_bar.progress(1.0, text="Mapping complete!")
+        fake_bar.progress(1.0, text="Demo data column mapping complete!")
         st.session_state.faker_mapped     = True
-        st.session_state.active_output    = "fake"
+        st.session_state.active_output    = "demo"
         st.rerun()
 
 # ─── Step 3: Review PII per Table ─────────────────────────────────────────────
@@ -1053,13 +1054,13 @@ if st.session_state.detection_done and st.session_state.table_pii_cols:
         st.success("✅ Masking applied to all tables!")
         st.rerun()
 
-# ─── Step 3b: Fake Data Review & Generate ─────────────────────────────────────
+# ─── Step 3b: Demo Data Review & Generate ──────────────────────────────────────
 
 if st.session_state.faker_mapped and st.session_state.faker_maps:
     st.divider()
     st.header("Step 3 — Review & Generate Demo Data")
     st.markdown(
-        "AI has mapped each column to a Faker method. "
+        "AI has mapped each column to a provider method (for demo data generation). "
         "**Edit mappings** and set **row counts per table**, then click Generate."
     )
 
@@ -1101,7 +1102,7 @@ if st.session_state.faker_mapped and st.session_state.faker_maps:
             rc_col, _ = st.columns([2, 4])
             with rc_col:
                 tbl_rows = st.number_input(
-                    "Rows to generate",
+                    "Demo rows to generate",
                     min_value=1, max_value=1_000_000,
                     value=int(default_rows),
                     key=f"rows_{table}",
@@ -1140,13 +1141,13 @@ if st.session_state.faker_mapped and st.session_state.faker_maps:
             if not fmap:
                 continue
             fake_df = generate_fake_dataframe(list(df_t.columns), fmap, df_t, int(n_rows))
-            if fake_mode == "Append fake rows to existing data" and not df_t.empty:
+            if fake_mode == "Append demo rows to existing data" and not df_t.empty:
                 result_df = pd.concat([df_t, fake_df], ignore_index=True)
             else:
                 result_df = fake_df
             st.session_state.faker_dfs[table] = result_df
-        gen_prog.progress(1.0, text="Done!")
-        st.session_state.active_output = "fake"
+        gen_prog.progress(1.0, text="Demo data generation complete!")
+        st.session_state.active_output = "demo"
         st.rerun()
 
     # Preview
@@ -1156,15 +1157,15 @@ if st.session_state.faker_mapped and st.session_state.faker_maps:
             with st.expander(f"📋 **{table}** — {len(fdf):,} rows", expanded=False):
                 st.dataframe(fdf.head(20), use_container_width=True)
 
-# ─── Step 4: Export (masked OR demo, whichever was last generated) ────────────
+# ─── Step 4: Export (masked OR demo, whichever was last generated) ─────────────
 
 _has_output = bool(st.session_state.table_masked_dfs or st.session_state.faker_dfs)
-_output_type = st.session_state.get("active_output")  # "masked" or "fake"
+_output_type = st.session_state.get("active_output")  # "masked" or "demo"
 
 if _has_output and _output_type:
     st.divider()
     _label = "Masked Data" if _output_type == "masked" else "Demo Data"
-    _export_dfs = st.session_state.table_masked_dfs if _output_type == "masked" else st.session_state.faker_dfs
+    _export_dfs = st.session_state.table_masked_dfs if _output_type == "masked" else st.session_state.faker_dfs  # faker_dfs holds demo data
     _file_prefix = "masked" if _output_type == "masked" else "demo"
     _zip_name    = "masked_tables.zip" if _output_type == "masked" else "demo_tables.zip"
 
@@ -1234,3 +1235,27 @@ if _has_output and _output_type:
 
 elif st.session_state.connection is None:
     st.info("👈 Select a data source in the sidebar and click Connect to begin.")
+
+# ─── Setup instructions (commented out — uncomment for dev reference) ──────────
+
+# with st.expander("ℹ️ Setup & prerequisites"):
+#     st.markdown("""
+# **Install packages:**
+# ```bash
+# pip install streamlit pandas snowflake-connector-python requests pyodbc sqlalchemy faker
+# ```
+#
+# **Ollama setup:**
+# ```bash
+# ollama pull llama3
+# ollama serve   # runs on http://localhost:11434
+# ```
+#
+# **Masking rules:**
+#
+# | Value length | Example | Masked |
+# |---|---|---|
+# | ≤ 4 chars | `John` | `****` |
+# | 5–10 chars | `john@x.co` | `j*******o` |
+# | > 10 chars | `john@email.com` | `jo**********om` |
+# """)
