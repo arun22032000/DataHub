@@ -23,15 +23,19 @@ def _hash(password: str) -> str:
     return hashlib.sha256(password.encode()).hexdigest()
 
 USER_DB = {
-    "admin":   _hash("admin123"),
+    "admin":   _hash("Ar#9598#Ar"),
     "analyst": _hash("analyst@2024"),
     "viewer":  _hash("view#only1"),
+    "p.a.sivakumar": _hash("pas001"),
+    "santhosh.shasthri": _hash("ss001")
 }
 
 ROLE_LABELS = {
     "admin":   "Administrator",
     "analyst": "Data Analyst",
     "viewer":  "Viewer",
+    "user":    "User01",
+    "user":    "User02"
 }
 
 def _check_credentials(username: str, password: str) -> bool:
@@ -45,10 +49,9 @@ def _render_login():
     # Centre-column layout
     _, mid, _ = st.columns([1.5, 2, 1.5])
     with mid:
-        st.markdown("<br><br>", unsafe_allow_html=True)
-        st.image("https://img.icons8.com/fluency/96/dna.png", width=72)
-        st.markdown("## 🧬 IntelliClone")
-        st.markdown("##### Intelligent Data Masking & Demo Data Generation")
+        st.markdown("<br><br>", unsafe_allow_html=
+        st.image("https://img.icons8.com/fluency/96/shield.png", width=72)
+        st.markdown("## 🛡️ IntelliClone")
         st.markdown("###### Please log in to continue")
         st.markdown("<br>", unsafe_allow_html=True)
 
@@ -79,7 +82,7 @@ if not st.session_state.get("authenticated", False):
     st.stop()
 
 st.set_page_config(page_title="IntelliClone", layout="wide")
-st.title("🧬 IntelliClone")
+st.title("🛡️ IntelliClone")
 st.markdown("Connect to a data source, auto-detect PII columns with Ollama, review, then mask or clone with demo data.")
 
 # ─── Regex patterns ───────────────────────────────────────────────────────────
