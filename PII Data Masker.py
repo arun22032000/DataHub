@@ -281,6 +281,22 @@ def _profile_column(series: pd.Series) -> dict:
 
     return profile
 
+# ─── Safe numeric range helpers ──────────────────────────────────────────────
+
+def _safe_int_range(mn, mx):
+    """Return (min, max) guaranteed to satisfy min < max for random_int."""
+    mn, mx = int(mn), int(mx)
+    if mn >= mx:
+        mx = mn + 1
+    return mn, mx
+
+def _safe_float_range(mn_f, mx_f):
+    """Return (min, max) guaranteed to satisfy min < max for pyfloat."""
+    mn_f, mx_f = float(mn_f), float(mx_f)
+    if mn_f >= mx_f:
+        mx_f = mn_f + 1.0
+    return mn_f, mx_f
+
 # ─── Smart value generator ────────────────────────────────────────────────────
 
 def _generate_typed_value(faker_fn: str, profile: dict):
@@ -307,6 +323,8 @@ def _generate_typed_value(faker_fn: str, profile: dict):
         try:
             min_dt = pd.to_datetime(profile.get("min_val"))
             max_dt = pd.to_datetime(profile.get("max_val"))
+            if min_dt >= max_dt:
+                max_dt = min_dt + pd.Timedelta(days=365)
             return _faker.date_time_between(start_date=min_dt, end_date=max_dt)
         except Exception:
             return _faker.date_time_this_decade()
@@ -321,29 +339,24 @@ def _generate_typed_value(faker_fn: str, profile: dict):
 
     # Numeric dtype — range-aware
     if "int" in dtype_str or "float" in dtype_str:
-        mn = int(profile.get("min_val", 0))
-        mx = int(profile.get("max_val", 99999))
         if "float" in dtype_str:
-            mn_f = float(profile.get("min_val", 0.0))
-            mx_f = float(profile.get("max_val", 99999.0))
+            mn_f, mx_f = _safe_float_range(profile.get("min_val", 0.0), profile.get("max_val", 99999.0))
             return round(_faker.pyfloat(min_value=mn_f, max_value=mx_f), 2)
-        return _faker.random_int(min=mn, max=max(mn, mx))
+        mn, mx = _safe_int_range(profile.get("min_val", 0), profile.get("max_val", 99999))
+        return _faker.random_int(min=mn, max=mx)
 
     # Numeric stored as string
     if profile.get("is_numeric_str"):
-        mn = int(profile.get("min_val", 0))
-        mx = int(profile.get("max_val", 99999))
-        return str(_faker.random_int(min=mn, max=max(mn, mx)))
+        mn, mx = _safe_int_range(profile.get("min_val", 0), profile.get("max_val", 99999))
+        return str(_faker.random_int(min=mn, max=mx))
 
     # Passthrough: infer from dtype/profile only (no semantic mapping found)
     if faker_fn == "__passthrough__":
         if "int" in dtype_str:
-            mn = int(profile.get("min_val", 0))
-            mx = int(profile.get("max_val", 99999))
-            return _faker.random_int(min=mn, max=max(mn, mx))
+            mn, mx = _safe_int_range(profile.get("min_val", 0), profile.get("max_val", 99999))
+            return _faker.random_int(min=mn, max=mx)
         if "float" in dtype_str:
-            mn_f = float(profile.get("min_val", 0.0))
-            mx_f = float(profile.get("max_val", 99999.0))
+            mn_f, mx_f = _safe_float_range(profile.get("min_val", 0.0), profile.get("max_val", 99999.0))
             return round(_faker.pyfloat(min_value=mn_f, max_value=mx_f), 2)
         # Unknown string: match original length range
         min_l = profile.get("min_len", 3)
@@ -356,12 +369,10 @@ def _generate_typed_value(faker_fn: str, profile: dict):
         if faker_fn == "random_element":
             return fn(elements=["Male", "Female", "Non-binary"])
         if faker_fn == "random_int":
-            mn = int(profile.get("min_val", 0))
-            mx = int(profile.get("max_val", 99999))
-            return fn(min=mn, max=max(mn + 1, mx))
+            mn, mx = _safe_int_range(profile.get("min_val", 0), profile.get("max_val", 99999))
+            return fn(min=mn, max=mx)
         if faker_fn == "pyfloat":
-            mn_f = float(profile.get("min_val", 0.0))
-            mx_f = float(profile.get("max_val", 99999.0))
+            mn_f, mx_f = _safe_float_range(profile.get("min_val", 0.0), profile.get("max_val", 99999.0))
             return round(fn(min_value=mn_f, max_value=mx_f), 2)
         if faker_fn in ("date_of_birth",):
             return fn(minimum_age=18, maximum_age=90).strftime("%Y-%m-%d")
