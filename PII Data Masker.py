@@ -568,7 +568,7 @@ _COL_NAME_OVERRIDES = [
       "birth_dt", "created_at", "updated_at", "issued", "inception",
       "_dt", "datetime", "timestamp"], "date_this_decade"),
     # Policy / reference numbers with common prefixes
-    (["policy_num", "policy_no", "pol_num", "pol_no",
+    (["policy_number","policy_num", "policy_no", "pol_num", "pol_no",
       "policy_id", "pol_id", "polnum", "polno"], "bothify"),
     # Generic reference / invoice / order codes
     (["ref_num", "ref_no", "refnum", "refno",
