@@ -207,6 +207,69 @@ def guess_faker_type(col_name: str) -> str:
             return faker_fn
     return "__passthrough__"  # signals: infer from dtype/samples at generation time
 
+# ─── Insurance-specific semantic overrides ───────────────────────────────────
+# These rules prevent critical insurance columns (effective_date, policy_type,
+# status, etc.) from being incorrectly mapped to address/person providers by AI
+# or keyword heuristics.
+INSURANCE_POLICY_TYPES = ["Auto", "Home", "Health", "Life", "Commercial"]
+INSURANCE_POLICY_STATUS = ["Active", "Expired", "Cancelled"]
+
+def _normalize_col(col: str) -> str:
+    return re.sub(r"[^a-z0-9_]", "", col.strip().lower().replace("-", "_").replace(" ", "_"))
+
+def apply_insurance_faker_overrides(columns: list[str], faker_map: dict[str, str]) -> dict[str, str]:
+    """Force safe/realistic Faker methods for common insurance columns."""
+    updated = dict(faker_map or {})
+    for col in columns:
+        c = _normalize_col(col)
+
+        # Effective/Expiry dates
+        if ("effective" in c or c in ("effdate", "eff_dt")) and "date" in c:
+            updated[col] = "date_this_decade"
+            continue
+        if any(k in c for k in ("expiry", "expiration", "expire")) and "date" in c:
+            updated[col] = "date_this_decade"
+            continue
+
+        # Policy type & status (categorical)
+        if ("policy" in c and "type" in c) or c in ("policytype", "policy_type"):
+            updated[col] = "random_element"
+            continue
+        if "status" in c and ("policy" in c or c in ("status", "policystatus", "policy_status")):
+            updated[col] = "random_element"
+            continue
+
+        # Policy number
+        if any(k in c for k in ("policy_number", "policynumber", "policy_no", "policyno")):
+            updated[col] = "bothify"
+            continue
+
+        # Premium / Sum insured
+        if any(k in c for k in ("premium", "premium_amount", "premiumamt")):
+            updated[col] = "pyfloat"
+            continue
+        if any(k in c for k in ("sum_insured", "suminsured", "coverage_amount", "coverage")):
+            updated[col] = "pyfloat"
+            continue
+
+    return updated
+
+def apply_insurance_profile_overrides(columns: list[str], profiles: dict[str, dict]) -> dict[str, dict]:
+    """Inject enum values for policy_type/status if sample data isn't enough."""
+    for col in columns:
+        c = _normalize_col(col)
+        prof = profiles.get(col, {"dtype_str": "object", "nullable": False, "null_rate": 0.0})
+
+        if ("policy" in c and "type" in c) or c in ("policytype", "policy_type"):
+            prof.setdefault("enum_values", INSURANCE_POLICY_TYPES)
+            profiles[col] = prof
+        if "status" in c and ("policy" in c or c in ("status", "policystatus", "policy_status")):
+            prof.setdefault("enum_values", INSURANCE_POLICY_STATUS)
+            profiles[col] = prof
+
+    return profiles
+
+
 # ─── Column profile: analyse samples to guide generation ─────────────────────
 
 def _profile_column(series: pd.Series) -> dict:
@@ -367,7 +430,9 @@ def _generate_typed_value(faker_fn: str, profile: dict):
     try:
         fn = getattr(_faker, faker_fn)
         if faker_fn == "random_element":
-            return fn(elements=["Male", "Female", "Non-binary"])
+            # If a column profile contains enum values, prefer them; otherwise fall back to a small generic set.
+            elements = profile.get("enum_values") or ["Y", "N", "Active", "Inactive"]
+            return fn(elements=elements)
         if faker_fn == "random_int":
             mn, mx = _safe_int_range(profile.get("min_val", 0), profile.get("max_val", 99999))
             return fn(min=mn, max=mx)
@@ -458,10 +523,12 @@ def ai_map_faker_columns(columns: list[str], ai_engine: str,
                 if fn != "__passthrough__" and not hasattr(_faker, fn):
                     fn = guess_faker_type(col)
                 mapped[col] = fn
-            return mapped
+    mapped = apply_insurance_faker_overrides(columns, mapped)
+    return mapped
     except Exception:
         pass
-    return {col: guess_faker_type(col) for col in columns}
+    fallback = {col: guess_faker_type(col) for col in columns}
+    return apply_insurance_faker_overrides(columns, fallback)
 
 # ─── Entity consistency groups ────────────────────────────────────────────────
 # Faker methods that derive from a shared "person" entity per row.
@@ -590,7 +657,10 @@ def generate_fake_dataframe(columns: list[str], faker_map: dict[str, str],
         else:
             profiles[col] = {"dtype_str": "object", "nullable": False, "null_rate": 0.0}
 
-    # Determine which columns participate in entity groups
+    
+    # Apply insurance domain overrides to profiles (ensures enums for policy_type/status)
+    profiles = apply_insurance_profile_overrides(columns, profiles)
+# Determine which columns participate in entity groups
     col_groups = _classify_columns(faker_map)
 
     # Pre-generate one entity object per row for each group that appears
