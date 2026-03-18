@@ -131,7 +131,7 @@ if not st.session_state.get("authenticated", False):
 
 st.set_page_config(page_title="IntelliClone", layout="wide")
 st.title("🛡️ IntelliClone")
-st.markdown("Connect to a data source, auto-detect PII columns with Ollama, review, then mask or clone with demo data.")
+st.markdown("Connect to a data source, auto-detect PII columns with AI, review, then mask or clone with demo data.")
 
 # ─── Regex patterns ───────────────────────────────────────────────────────────
 
@@ -248,11 +248,8 @@ def _profile_column(series: pd.Series) -> dict:
     unique_ratio = non_null.nunique() / len(non_null)
     profile["unique_ratio"] = unique_ratio
 
-    # Enum detection: ≤15 unique values covering ≥80% of non-null
-    if non_null.nunique() <= 15 and unique_ratio <= 0.5:
-        profile["enum_values"] = non_null.value_counts().head(15).index.tolist()
-
-    # Date string detection
+    # ── Date string detection — check BEFORE enum so date columns aren't
+    #    misclassified as enums when they have few distinct values
     sample_val = str_vals.iloc[0]
     for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%d/%m/%Y", "%Y/%m/%d",
                 "%d-%m-%Y", "%m-%d-%Y", "%Y-%m-%d %H:%M:%S", "%d-%b-%Y"):
@@ -264,17 +261,56 @@ def _profile_column(series: pd.Series) -> dict:
         except Exception:
             pass
 
-    # Numeric-string detection
-    try:
-        numeric_vals = pd.to_numeric(str_vals, errors="coerce")
-        if numeric_vals.notna().mean() > 0.8:
-            profile["min_val"] = float(numeric_vals.min())
-            profile["max_val"] = float(numeric_vals.max())
-            profile["is_numeric_str"] = True
-    except Exception:
-        pass
+    # ── Numeric-string detection (before enum so pure-numeric strings stay numeric)
+    if not profile.get("is_date_str"):
+        try:
+            numeric_vals = pd.to_numeric(str_vals, errors="coerce")
+            if numeric_vals.notna().mean() > 0.8:
+                profile["min_val"] = float(numeric_vals.min())
+                profile["max_val"] = float(numeric_vals.max())
+                profile["is_numeric_str"] = True
+        except Exception:
+            pass
 
-    # String length profile
+    # ── Pattern / code detection — e.g. "POL-2025-100003", "INV-001", "TXN-ABC-123"
+    #    Detect if values follow a consistent template with fixed separators and
+    #    varying numeric/alpha segments. Build a bothify template from a sample.
+    if not profile.get("is_date_str") and not profile.get("is_numeric_str"):
+        try:
+            import re as _re
+            # Check that most values share the same "shape" (letters→?, digits→#, sep→sep)
+            def _to_shape(s):
+                s = _re.sub(r'[A-Za-z]+', 'A', s)
+                s = _re.sub(r'[0-9]+', 'N', s)
+                return s
+
+            shapes = str_vals.head(20).apply(_to_shape)
+            top_shape, top_count = shapes.value_counts().iloc[0], shapes.value_counts().iloc[0]
+            shape_ratio = top_count / len(shapes)
+
+            if shape_ratio >= 0.7 and _re.search(r'[^A-Za-z0-9]', sample_val):
+                # Build a bothify template from the most common sample
+                template = _re.sub(r'[A-Za-z]', '?', sample_val)
+                template = _re.sub(r'[0-9]', '#', template)
+                # Only flag as pattern if it actually has mixed content
+                if '?' in template and '#' in template:
+                    profile["is_pattern_str"] = True
+                    profile["pattern_template"] = template
+                elif '#' in template and len(template) <= 20:
+                    profile["is_pattern_str"] = True
+                    profile["pattern_template"] = template
+        except Exception:
+            pass
+
+    # ── Enum detection: ≤15 unique values, only for non-date, non-numeric, non-pattern cols
+    if (not profile.get("is_date_str")
+            and not profile.get("is_numeric_str")
+            and not profile.get("is_pattern_str")
+            and non_null.nunique() <= 15
+            and unique_ratio <= 0.5):
+        profile["enum_values"] = non_null.value_counts().head(15).index.tolist()
+
+    # ── String length profile
     lengths = str_vals.str.len()
     profile["min_len"] = int(lengths.min())
     profile["max_len"] = int(lengths.max())
@@ -329,13 +365,21 @@ def _generate_typed_value(faker_fn: str, profile: dict):
         except Exception:
             return _faker.date_time_this_decade()
 
-    # Date string column
+    # Date string column — always override AI faker_fn for date-shaped values
     if profile.get("is_date_str"):
         fmt = profile.get("date_fmt", "%Y-%m-%d")
         try:
             return _faker.date_this_decade(before_today=True, after_today=False).strftime(fmt)
         except Exception:
             return _faker.date()
+
+    # Pattern / code string (e.g. "POL-2025-100003", "INV-001") — reproduce template
+    if profile.get("is_pattern_str"):
+        template = profile.get("pattern_template", "??-####")
+        try:
+            return _faker.bothify(text=template)
+        except Exception:
+            return _faker.bothify(text="??-####")
 
     # Numeric dtype — range-aware
     if "int" in dtype_str or "float" in dtype_str:
@@ -403,9 +447,17 @@ Available Faker methods: name, first_name, last_name, email, phone_number, ssn, 
 Rules:
 - Return ONLY a JSON object: keys = column names, values = Faker method names from the list above.
 - No markdown fences, no explanation.
-- Use sample values to understand the data shape (e.g. 2-letter state codes → state_abbr, Y/N → random_element).
-- For numeric ID/PK columns use random_int.
-- For columns with only a few distinct values (like status flags), use random_element.
+- Study the sample VALUES carefully — the shape of the value matters more than the column name.
+- Dates (e.g. "2025-01-04", "01/15/2024") → date_this_decade
+- Timestamps (e.g. "2025-01-04 10:30:00") → date_time_this_decade
+- Coded IDs / reference numbers (e.g. "POL-2025-100003", "INV-001", "TXN-ABC-123") → bothify
+- Numeric-only strings (e.g. "100003", "4200") → random_int
+- 2-letter state codes → state_abbr
+- Y/N or True/False flags → boolean
+- Small fixed set of values (status, type, category) → random_element
+- Numeric IDs or primary keys → random_int
+- If sample values contain letters AND digits AND separators (like dashes) forming a code pattern → bothify
+- NEVER return address, street_address, city, state, or zipcode for columns that contain dates, codes, IDs, or numbers.
 - If truly unsure, use word.
 
 Column samples (name: [sample values]):
