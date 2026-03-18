@@ -131,7 +131,7 @@ if not st.session_state.get("authenticated", False):
 
 st.set_page_config(page_title="IntelliClone", layout="wide")
 st.title("🛡️ IntelliClone")
-st.markdown("Connect to a data source, auto-detect PII columns with Ollama, review, then mask or clone with demo data.")
+st.markdown("Connect to a data source, auto-detect PII columns with AI, review, then mask or clone with demo data.")
 
 # ─── Regex patterns ───────────────────────────────────────────────────────────
 
@@ -207,69 +207,6 @@ def guess_faker_type(col_name: str) -> str:
             return faker_fn
     return "__passthrough__"  # signals: infer from dtype/samples at generation time
 
-# ─── Insurance-specific semantic overrides ───────────────────────────────────
-# These rules prevent critical insurance columns (effective_date, policy_type,
-# status, etc.) from being incorrectly mapped to address/person providers by AI
-# or keyword heuristics.
-INSURANCE_POLICY_TYPES = ["Auto", "Home", "Health", "Life", "Commercial"]
-INSURANCE_POLICY_STATUS = ["Active", "Expired", "Cancelled"]
-
-def _normalize_col(col: str) -> str:
-    return re.sub(r"[^a-z0-9_]", "", col.strip().lower().replace("-", "_").replace(" ", "_"))
-
-def apply_insurance_faker_overrides(columns: list[str], faker_map: dict[str, str]) -> dict[str, str]:
-    """Force safe/realistic Faker methods for common insurance columns."""
-    updated = dict(faker_map or {})
-    for col in columns:
-        c = _normalize_col(col)
-
-        # Effective/Expiry dates
-        if ("effective" in c or c in ("effdate", "eff_dt")) and "date" in c:
-            updated[col] = "date_this_decade"
-            continue
-        if any(k in c for k in ("expiry", "expiration", "expire")) and "date" in c:
-            updated[col] = "date_this_decade"
-            continue
-
-        # Policy type & status (categorical)
-        if ("policy" in c and "type" in c) or c in ("policytype", "policy_type"):
-            updated[col] = "random_element"
-            continue
-        if "status" in c and ("policy" in c or c in ("status", "policystatus", "policy_status")):
-            updated[col] = "random_element"
-            continue
-
-        # Policy number
-        if any(k in c for k in ("policy_number", "policynumber", "policy_no", "policyno")):
-            updated[col] = "bothify"
-            continue
-
-        # Premium / Sum insured
-        if any(k in c for k in ("premium", "premium_amount", "premiumamt")):
-            updated[col] = "pyfloat"
-            continue
-        if any(k in c for k in ("sum_insured", "suminsured", "coverage_amount", "coverage")):
-            updated[col] = "pyfloat"
-            continue
-
-    return updated
-
-def apply_insurance_profile_overrides(columns: list[str], profiles: dict[str, dict]) -> dict[str, dict]:
-    """Inject enum values for policy_type/status if sample data isn't enough."""
-    for col in columns:
-        c = _normalize_col(col)
-        prof = profiles.get(col, {"dtype_str": "object", "nullable": False, "null_rate": 0.0})
-
-        if ("policy" in c and "type" in c) or c in ("policytype", "policy_type"):
-            prof.setdefault("enum_values", INSURANCE_POLICY_TYPES)
-            profiles[col] = prof
-        if "status" in c and ("policy" in c or c in ("status", "policystatus", "policy_status")):
-            prof.setdefault("enum_values", INSURANCE_POLICY_STATUS)
-            profiles[col] = prof
-
-    return profiles
-
-
 # ─── Column profile: analyse samples to guide generation ─────────────────────
 
 def _profile_column(series: pd.Series) -> dict:
@@ -311,11 +248,8 @@ def _profile_column(series: pd.Series) -> dict:
     unique_ratio = non_null.nunique() / len(non_null)
     profile["unique_ratio"] = unique_ratio
 
-    # Enum detection: ≤15 unique values covering ≥80% of non-null
-    if non_null.nunique() <= 15 and unique_ratio <= 0.5:
-        profile["enum_values"] = non_null.value_counts().head(15).index.tolist()
-
-    # Date string detection
+    # ── Date string detection — check BEFORE enum so date columns aren't
+    #    misclassified as enums when they have few distinct values
     sample_val = str_vals.iloc[0]
     for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%d/%m/%Y", "%Y/%m/%d",
                 "%d-%m-%Y", "%m-%d-%Y", "%Y-%m-%d %H:%M:%S", "%d-%b-%Y"):
@@ -327,17 +261,56 @@ def _profile_column(series: pd.Series) -> dict:
         except Exception:
             pass
 
-    # Numeric-string detection
-    try:
-        numeric_vals = pd.to_numeric(str_vals, errors="coerce")
-        if numeric_vals.notna().mean() > 0.8:
-            profile["min_val"] = float(numeric_vals.min())
-            profile["max_val"] = float(numeric_vals.max())
-            profile["is_numeric_str"] = True
-    except Exception:
-        pass
+    # ── Numeric-string detection (before enum so pure-numeric strings stay numeric)
+    if not profile.get("is_date_str"):
+        try:
+            numeric_vals = pd.to_numeric(str_vals, errors="coerce")
+            if numeric_vals.notna().mean() > 0.8:
+                profile["min_val"] = float(numeric_vals.min())
+                profile["max_val"] = float(numeric_vals.max())
+                profile["is_numeric_str"] = True
+        except Exception:
+            pass
 
-    # String length profile
+    # ── Pattern / code detection — e.g. "POL-2025-100003", "INV-001", "TXN-ABC-123"
+    #    Detect if values follow a consistent template with fixed separators and
+    #    varying numeric/alpha segments. Build a bothify template from a sample.
+    if not profile.get("is_date_str") and not profile.get("is_numeric_str"):
+        try:
+            import re as _re
+            # Check that most values share the same "shape" (letters→?, digits→#, sep→sep)
+            def _to_shape(s):
+                s = _re.sub(r'[A-Za-z]+', 'A', s)
+                s = _re.sub(r'[0-9]+', 'N', s)
+                return s
+
+            shapes = str_vals.head(20).apply(_to_shape)
+            top_shape, top_count = shapes.value_counts().iloc[0], shapes.value_counts().iloc[0]
+            shape_ratio = top_count / len(shapes)
+
+            if shape_ratio >= 0.7 and _re.search(r'[^A-Za-z0-9]', sample_val):
+                # Build a bothify template from the most common sample
+                template = _re.sub(r'[A-Za-z]', '?', sample_val)
+                template = _re.sub(r'[0-9]', '#', template)
+                # Only flag as pattern if it actually has mixed content
+                if '?' in template and '#' in template:
+                    profile["is_pattern_str"] = True
+                    profile["pattern_template"] = template
+                elif '#' in template and len(template) <= 20:
+                    profile["is_pattern_str"] = True
+                    profile["pattern_template"] = template
+        except Exception:
+            pass
+
+    # ── Enum detection: ≤15 unique values, only for non-date, non-numeric, non-pattern cols
+    if (not profile.get("is_date_str")
+            and not profile.get("is_numeric_str")
+            and not profile.get("is_pattern_str")
+            and non_null.nunique() <= 15
+            and unique_ratio <= 0.5):
+        profile["enum_values"] = non_null.value_counts().head(15).index.tolist()
+
+    # ── String length profile
     lengths = str_vals.str.len()
     profile["min_len"] = int(lengths.min())
     profile["max_len"] = int(lengths.max())
@@ -392,13 +365,21 @@ def _generate_typed_value(faker_fn: str, profile: dict):
         except Exception:
             return _faker.date_time_this_decade()
 
-    # Date string column
+    # Date string column — always override AI faker_fn for date-shaped values
     if profile.get("is_date_str"):
         fmt = profile.get("date_fmt", "%Y-%m-%d")
         try:
             return _faker.date_this_decade(before_today=True, after_today=False).strftime(fmt)
         except Exception:
             return _faker.date()
+
+    # Pattern / code string (e.g. "POL-2025-100003", "INV-001") — reproduce template
+    if profile.get("is_pattern_str"):
+        template = profile.get("pattern_template", "??-####")
+        try:
+            return _faker.bothify(text=template)
+        except Exception:
+            return _faker.bothify(text="??-####")
 
     # Numeric dtype — range-aware
     if "int" in dtype_str or "float" in dtype_str:
@@ -430,9 +411,7 @@ def _generate_typed_value(faker_fn: str, profile: dict):
     try:
         fn = getattr(_faker, faker_fn)
         if faker_fn == "random_element":
-            # If a column profile contains enum values, prefer them; otherwise fall back to a small generic set.
-            elements = profile.get("enum_values") or ["Y", "N", "Active", "Inactive"]
-            return fn(elements=elements)
+            return fn(elements=["Male", "Female", "Non-binary"])
         if faker_fn == "random_int":
             mn, mx = _safe_int_range(profile.get("min_val", 0), profile.get("max_val", 99999))
             return fn(min=mn, max=mx)
@@ -468,9 +447,17 @@ Available Faker methods: name, first_name, last_name, email, phone_number, ssn, 
 Rules:
 - Return ONLY a JSON object: keys = column names, values = Faker method names from the list above.
 - No markdown fences, no explanation.
-- Use sample values to understand the data shape (e.g. 2-letter state codes → state_abbr, Y/N → random_element).
-- For numeric ID/PK columns use random_int.
-- For columns with only a few distinct values (like status flags), use random_element.
+- Study the sample VALUES carefully — the shape of the value matters more than the column name.
+- Dates (e.g. "2025-01-04", "01/15/2024") → date_this_decade
+- Timestamps (e.g. "2025-01-04 10:30:00") → date_time_this_decade
+- Coded IDs / reference numbers (e.g. "POL-2025-100003", "INV-001", "TXN-ABC-123") → bothify
+- Numeric-only strings (e.g. "100003", "4200") → random_int
+- 2-letter state codes → state_abbr
+- Y/N or True/False flags → boolean
+- Small fixed set of values (status, type, category) → random_element
+- Numeric IDs or primary keys → random_int
+- If sample values contain letters AND digits AND separators (like dashes) forming a code pattern → bothify
+- NEVER return address, street_address, city, state, or zipcode for columns that contain dates, codes, IDs, or numbers.
 - If truly unsure, use word.
 
 Column samples (name: [sample values]):
@@ -523,12 +510,10 @@ def ai_map_faker_columns(columns: list[str], ai_engine: str,
                 if fn != "__passthrough__" and not hasattr(_faker, fn):
                     fn = guess_faker_type(col)
                 mapped[col] = fn
-    mapped = apply_insurance_faker_overrides(columns, mapped)
-    return mapped
+            return mapped
     except Exception:
         pass
-    fallback = {col: guess_faker_type(col) for col in columns}
-    return apply_insurance_faker_overrides(columns, fallback)
+    return {col: guess_faker_type(col) for col in columns}
 
 # ─── Entity consistency groups ────────────────────────────────────────────────
 # Faker methods that derive from a shared "person" entity per row.
@@ -657,10 +642,7 @@ def generate_fake_dataframe(columns: list[str], faker_map: dict[str, str],
         else:
             profiles[col] = {"dtype_str": "object", "nullable": False, "null_rate": 0.0}
 
-    
-    # Apply insurance domain overrides to profiles (ensures enums for policy_type/status)
-    profiles = apply_insurance_profile_overrides(columns, profiles)
-# Determine which columns participate in entity groups
+    # Determine which columns participate in entity groups
     col_groups = _classify_columns(faker_map)
 
     # Pre-generate one entity object per row for each group that appears
