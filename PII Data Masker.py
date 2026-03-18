@@ -210,110 +210,148 @@ def guess_faker_type(col_name: str) -> str:
 # ─── Column profile: analyse samples to guide generation ─────────────────────
 
 def _profile_column(series: pd.Series) -> dict:
-    """Derive min, max, nullrate, unique_ratio, date_fmt, enum_values from a sample series."""
+    """Deep-profile a column: dtype, range, date format, decimal precision,
+    pattern template, enum values, string length — all used to generate
+    values that are similar to what is already in the field."""
+    import re as _re
+
     profile = {"nullable": False, "dtype_str": str(series.dtype)}
     non_null = series.dropna()
-    if len(series) > 0:
-        profile["nullable"] = series.isna().mean() > 0.0
-        profile["null_rate"] = float(series.isna().mean())
-    else:
-        profile["null_rate"] = 0.0
+    profile["null_rate"] = float(series.isna().mean()) if len(series) > 0 else 0.0
+    profile["nullable"]  = profile["null_rate"] > 0.0
 
     if len(non_null) == 0:
         return profile
 
     dtype_str = str(series.dtype)
 
-    # Numeric
+    # ── Numeric dtype ─────────────────────────────────────────────────────────
     if "int" in dtype_str or "float" in dtype_str:
-        profile["min_val"] = float(non_null.min())
-        profile["max_val"] = float(non_null.max())
+        profile["min_val"]  = float(non_null.min())
+        profile["max_val"]  = float(non_null.max())
         profile["mean_val"] = float(non_null.mean())
+        if "float" in dtype_str:
+            # Capture decimal precision from actual values
+            decimals = non_null.dropna().apply(
+                lambda x: len(str(x).rstrip("0").split(".")[-1]) if "." in str(x) else 0
+            )
+            profile["decimal_places"] = int(decimals.median()) if len(decimals) else 2
         return profile
 
-    # Boolean
+    # ── Boolean dtype ─────────────────────────────────────────────────────────
     if "bool" in dtype_str:
-        profile["is_bool"] = True
+        profile["is_bool"]     = True
+        profile["true_ratio"]  = float(non_null.mean())
         return profile
 
-    # Datetime
+    # ── Datetime dtype ────────────────────────────────────────────────────────
     if "datetime" in dtype_str:
         profile["is_datetime"] = True
-        profile["min_val"] = str(non_null.min())
-        profile["max_val"] = str(non_null.max())
+        profile["min_val"]     = str(non_null.min())
+        profile["max_val"]     = str(non_null.max())
+        # Detect if time component is always midnight (date-only stored as datetime)
+        if hasattr(non_null.iloc[0], "hour"):
+            profile["time_always_zero"] = bool((non_null.dt.hour == 0).all())
         return profile
 
-    # String analysis
-    str_vals = non_null.astype(str)
+    # ── String analysis ───────────────────────────────────────────────────────
+    str_vals    = non_null.astype(str)
     unique_ratio = non_null.nunique() / len(non_null)
     profile["unique_ratio"] = unique_ratio
 
-    # ── Date string detection — check BEFORE enum so date columns aren't
-    #    misclassified as enums when they have few distinct values
-    sample_val = str_vals.iloc[0]
-    for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%d/%m/%Y", "%Y/%m/%d",
-                "%d-%m-%Y", "%m-%d-%Y", "%Y-%m-%d %H:%M:%S", "%d-%b-%Y"):
-        try:
-            pd.to_datetime(sample_val, format=fmt)
-            profile["date_fmt"] = fmt
-            profile["is_date_str"] = True
-            break
-        except Exception:
-            pass
-
-    # ── Numeric-string detection (before enum so pure-numeric strings stay numeric)
-    if not profile.get("is_date_str"):
-        try:
-            numeric_vals = pd.to_numeric(str_vals, errors="coerce")
-            if numeric_vals.notna().mean() > 0.8:
-                profile["min_val"] = float(numeric_vals.min())
-                profile["max_val"] = float(numeric_vals.max())
-                profile["is_numeric_str"] = True
-        except Exception:
-            pass
-
-    # ── Pattern / code detection — e.g. "POL-2025-100003", "INV-001", "TXN-ABC-123"
-    #    Detect if values follow a consistent template with fixed separators and
-    #    varying numeric/alpha segments. Build a bothify template from a sample.
-    if not profile.get("is_date_str") and not profile.get("is_numeric_str"):
-        try:
-            import re as _re
-            # Check that most values share the same "shape" (letters→?, digits→#, sep→sep)
-            def _to_shape(s):
-                s = _re.sub(r'[A-Za-z]+', 'A', s)
-                s = _re.sub(r'[0-9]+', 'N', s)
-                return s
-
-            shapes = str_vals.head(20).apply(_to_shape)
-            top_shape, top_count = shapes.value_counts().iloc[0], shapes.value_counts().iloc[0]
-            shape_ratio = top_count / len(shapes)
-
-            if shape_ratio >= 0.7 and _re.search(r'[^A-Za-z0-9]', sample_val):
-                # Build a bothify template from the most common sample
-                template = _re.sub(r'[A-Za-z]', '?', sample_val)
-                template = _re.sub(r'[0-9]', '#', template)
-                # Only flag as pattern if it actually has mixed content
-                if '?' in template and '#' in template:
-                    profile["is_pattern_str"] = True
-                    profile["pattern_template"] = template
-                elif '#' in template and len(template) <= 20:
-                    profile["is_pattern_str"] = True
-                    profile["pattern_template"] = template
-        except Exception:
-            pass
-
-    # ── Enum detection: ≤15 unique values, only for non-date, non-numeric, non-pattern cols
-    if (not profile.get("is_date_str")
-            and not profile.get("is_numeric_str")
-            and not profile.get("is_pattern_str")
-            and non_null.nunique() <= 15
-            and unique_ratio <= 0.5):
-        profile["enum_values"] = non_null.value_counts().head(15).index.tolist()
-
-    # ── String length profile
+    # Profile string lengths
     lengths = str_vals.str.len()
-    profile["min_len"] = int(lengths.min())
-    profile["max_len"] = int(lengths.max())
+    profile["min_len"]  = int(lengths.min())
+    profile["max_len"]  = int(lengths.max())
+    profile["mean_len"] = int(lengths.mean())
+
+    # ── 1. Date string detection (highest priority — before enum/pattern) ──────
+    _DATE_FMTS = [
+        "%Y-%m-%d", "%m/%d/%Y", "%d/%m/%Y", "%Y/%m/%d",
+        "%d-%m-%Y", "%m-%d-%Y", "%Y-%m-%d %H:%M:%S",
+        "%d-%b-%Y", "%b %d, %Y", "%Y%m%d",
+    ]
+    # Test multiple samples for robustness (not just first row)
+    date_hits = 0
+    detected_fmt = None
+    for sv in str_vals.head(10).tolist():
+        for fmt in _DATE_FMTS:
+            try:
+                dt = pd.to_datetime(sv, format=fmt)
+                date_hits += 1
+                if detected_fmt is None:
+                    detected_fmt = fmt
+                    # Store actual date range so generated dates stay in-period
+                    try:
+                        parsed = pd.to_datetime(str_vals, format=fmt, errors="coerce").dropna()
+                        if len(parsed):
+                            profile["date_min"] = str(parsed.min().date())
+                            profile["date_max"] = str(parsed.max().date())
+                    except Exception:
+                        pass
+                break
+            except Exception:
+                pass
+    if date_hits >= min(3, len(str_vals)):
+        profile["date_fmt"]     = detected_fmt or "%Y-%m-%d"
+        profile["is_date_str"]  = True
+        return profile   # return early — no further checks needed
+
+    # ── 2. Numeric-string detection ───────────────────────────────────────────
+    numeric_vals = pd.to_numeric(str_vals, errors="coerce")
+    if numeric_vals.notna().mean() > 0.8:
+        profile["min_val"]        = float(numeric_vals.min())
+        profile["max_val"]        = float(numeric_vals.max())
+        profile["is_numeric_str"] = True
+        # Preserve leading zeros (e.g. "007", "00123")
+        if str_vals.str.match(r"^0\d").any():
+            profile["leading_zeros"] = True
+            profile["fixed_len"]     = profile["min_len"]
+        return profile
+
+    # ── 3. Pattern / coded-ID detection ──────────────────────────────────────
+    #    e.g. "POL-2025-100003", "INV-001", "TXN-ABC-123"
+    #    Strategy: find the fixed prefix, then make a bothify template for the rest.
+    def _to_shape(s):
+        s = _re.sub(r"[A-Za-z]+", "A", s)
+        s = _re.sub(r"[0-9]+",   "N", s)
+        return s
+
+    shapes = str_vals.head(30).apply(_to_shape)
+    top_shape = shapes.value_counts().index[0]
+    shape_ratio = shapes.value_counts().iloc[0] / len(shapes)
+
+    if shape_ratio >= 0.65 and _re.search(r"[^AN]", top_shape):
+        # Find the longest common prefix across samples (the fixed literal part)
+        samples_list = str_vals.head(30).tolist()
+        prefix = samples_list[0]
+        for sv in samples_list[1:]:
+            while not sv.startswith(prefix) and prefix:
+                prefix = prefix[:-1]
+        # Build bothify template: keep prefix literal, replace only the variable part
+        suffix_example = samples_list[0][len(prefix):]
+        tmpl_suffix    = _re.sub(r"[A-Za-z]", "?", suffix_example)
+        tmpl_suffix    = _re.sub(r"[0-9]",    "#", tmpl_suffix)
+        full_template  = prefix + tmpl_suffix
+        if ("#" in tmpl_suffix or "?" in tmpl_suffix) and len(full_template) <= 40:
+            profile["is_pattern_str"]  = True
+            profile["pattern_template"] = full_template
+            profile["pattern_prefix"]   = prefix
+            return profile
+
+    # ── 4. Enum / categorical ─────────────────────────────────────────────────
+    if non_null.nunique() <= 20 and unique_ratio <= 0.6:
+        vc = non_null.value_counts(normalize=True)
+        profile["enum_values"]  = vc.index.tolist()
+        profile["enum_weights"] = vc.values.tolist()  # preserve original distribution
+        return profile
+
+    # ── 5. Free text / long string ────────────────────────────────────────────
+    # Sample a few values to detect if it's sentence-like
+    sample_texts = str_vals.head(5).tolist()
+    avg_words = sum(len(str(t).split()) for t in sample_texts) / max(len(sample_texts), 1)
+    if avg_words > 4:
+        profile["is_text"] = True
 
     return profile
 
@@ -336,9 +374,10 @@ def _safe_float_range(mn_f, mx_f):
 # ─── Smart value generator ────────────────────────────────────────────────────
 
 def _generate_typed_value(faker_fn: str, profile: dict):
-    """Generate a single value respecting the column profile."""
+    """Generate a single value that closely matches the original column's data shape."""
+    import random as _random
 
-    # ── Pattern template encoded directly in faker_fn (e.g. "__pattern__POL-####") ──
+    # ── Pattern template encoded in faker_fn by override system ───────────────
     if faker_fn and faker_fn.startswith("__pattern__"):
         template = faker_fn[len("__pattern__"):]
         try:
@@ -346,42 +385,51 @@ def _generate_typed_value(faker_fn: str, profile: dict):
         except Exception:
             return _faker.bothify(text="??-####")
 
-    # Nullable: randomly inject None
+    # ── Nullable injection ────────────────────────────────────────────────────
     if profile.get("nullable") and profile.get("null_rate", 0) > 0:
-        import random
-        if random.random() < profile["null_rate"]:
+        if _random.random() < profile["null_rate"]:
             return None
 
     dtype_str = profile.get("dtype_str", "")
 
-    # Boolean
+    # ── Profile-driven overrides — fire BEFORE any AI faker_fn ────────────────
+
+    # Boolean (weighted by original true ratio)
     if profile.get("is_bool") or "bool" in dtype_str:
-        return _faker.boolean()
+        true_ratio = profile.get("true_ratio", 0.5)
+        return _random.random() < true_ratio
 
-    # Enum / categorical
-    if "enum_values" in profile:
-        return _faker.random_element(elements=profile["enum_values"])
+    # Date string — use actual date range from the data
+    if profile.get("is_date_str"):
+        fmt  = profile.get("date_fmt", "%Y-%m-%d")
+        dmin = profile.get("date_min")
+        dmax = profile.get("date_max")
+        try:
+            if dmin and dmax:
+                start = pd.to_datetime(dmin).to_pydatetime()
+                end   = pd.to_datetime(dmax).to_pydatetime()
+                if start >= end:
+                    end = start + pd.Timedelta(days=365)
+                return _faker.date_time_between(start_date=start, end_date=end).strftime(fmt)
+            return _faker.date_this_decade(before_today=True, after_today=False).strftime(fmt)
+        except Exception:
+            return _faker.date()
 
-    # Datetime column
+    # Datetime dtype — use actual range, preserve time-only or full datetime
     if profile.get("is_datetime"):
         try:
             min_dt = pd.to_datetime(profile.get("min_val"))
             max_dt = pd.to_datetime(profile.get("max_val"))
             if min_dt >= max_dt:
                 max_dt = min_dt + pd.Timedelta(days=365)
-            return _faker.date_time_between(start_date=min_dt, end_date=max_dt)
+            dt = _faker.date_time_between(start_date=min_dt, end_date=max_dt)
+            if profile.get("time_always_zero"):
+                return dt.replace(hour=0, minute=0, second=0)
+            return dt
         except Exception:
             return _faker.date_time_this_decade()
 
-    # Date string column — always override AI faker_fn for date-shaped values
-    if profile.get("is_date_str"):
-        fmt = profile.get("date_fmt", "%Y-%m-%d")
-        try:
-            return _faker.date_this_decade(before_today=True, after_today=False).strftime(fmt)
-        except Exception:
-            return _faker.date()
-
-    # Pattern / code string (e.g. "POL-2025-100003", "INV-001") — reproduce template
+    # Pattern / coded IDs — keep prefix, randomise only variable segments
     if profile.get("is_pattern_str"):
         template = profile.get("pattern_template", "??-####")
         try:
@@ -389,56 +437,89 @@ def _generate_typed_value(faker_fn: str, profile: dict):
         except Exception:
             return _faker.bothify(text="??-####")
 
-    # Numeric dtype — range-aware
+    # Enum / categorical — sample with original distribution weights
+    if "enum_values" in profile:
+        vals    = profile["enum_values"]
+        weights = profile.get("enum_weights")
+        if weights and len(weights) == len(vals):
+            return _random.choices(vals, weights=weights, k=1)[0]
+        return _random.choice(vals)
+
+    # Numeric dtype — range-aware with correct precision
     if "int" in dtype_str or "float" in dtype_str:
         if "float" in dtype_str:
             mn_f, mx_f = _safe_float_range(profile.get("min_val", 0.0), profile.get("max_val", 99999.0))
-            return round(_faker.pyfloat(min_value=mn_f, max_value=mx_f), 2)
+            dp = profile.get("decimal_places", 2)
+            return round(_faker.pyfloat(min_value=mn_f, max_value=mx_f), dp)
         mn, mx = _safe_int_range(profile.get("min_val", 0), profile.get("max_val", 99999))
         return _faker.random_int(min=mn, max=mx)
 
-    # Numeric stored as string
+    # Numeric stored as string — preserve leading zeros and length if detected
     if profile.get("is_numeric_str"):
         mn, mx = _safe_int_range(profile.get("min_val", 0), profile.get("max_val", 99999))
-        return str(_faker.random_int(min=mn, max=mx))
+        val = _faker.random_int(min=mn, max=mx)
+        if profile.get("leading_zeros") and profile.get("fixed_len"):
+            return str(val).zfill(profile["fixed_len"])
+        return str(val)
 
-    # Passthrough: infer from dtype/profile only (no semantic mapping found)
+    # Free text / sentence
+    if profile.get("is_text"):
+        return _faker.sentence()
+
+    # Passthrough — pure dtype inference
     if faker_fn == "__passthrough__":
         if "int" in dtype_str:
             mn, mx = _safe_int_range(profile.get("min_val", 0), profile.get("max_val", 99999))
             return _faker.random_int(min=mn, max=mx)
         if "float" in dtype_str:
             mn_f, mx_f = _safe_float_range(profile.get("min_val", 0.0), profile.get("max_val", 99999.0))
-            return round(_faker.pyfloat(min_value=mn_f, max_value=mx_f), 2)
-        # Unknown string: match original length range
+            return round(_faker.pyfloat(min_value=mn_f, max_value=mx_f), profile.get("decimal_places", 2))
+        # String: match original length
         min_l = profile.get("min_len", 3)
-        max_l = profile.get("max_len", 20)
-        return _faker.lexify("?" * min(max_l, 20))
+        max_l = min(profile.get("max_len", 20), 40)
+        return _faker.lexify("?" * _random.randint(min_l, max_l))
 
-    # Named Faker method with smart args
+    # Named Faker method — with profile-aware arguments
     try:
         fn = getattr(_faker, faker_fn)
         if faker_fn == "random_element":
+            # Use enum_values if available, else fallback
+            if "enum_values" in profile:
+                return _random.choice(profile["enum_values"])
             return fn(elements=["Male", "Female", "Non-binary"])
         if faker_fn == "random_int":
             mn, mx = _safe_int_range(profile.get("min_val", 0), profile.get("max_val", 99999))
             return fn(min=mn, max=mx)
         if faker_fn == "pyfloat":
             mn_f, mx_f = _safe_float_range(profile.get("min_val", 0.0), profile.get("max_val", 99999.0))
-            return round(fn(min_value=mn_f, max_value=mx_f), 2)
-        if faker_fn in ("date_of_birth",):
-            return fn(minimum_age=18, maximum_age=90).strftime("%Y-%m-%d")
+            return round(fn(min_value=mn_f, max_value=mx_f), profile.get("decimal_places", 2))
+        if faker_fn == "date_of_birth":
+            # Infer age range from dob range if available
+            return fn(minimum_age=18, maximum_age=90).strftime(profile.get("date_fmt", "%Y-%m-%d"))
         if faker_fn == "date_this_decade":
-            return fn().strftime("%Y-%m-%d")
+            fmt  = profile.get("date_fmt", "%Y-%m-%d")
+            dmin = profile.get("date_min")
+            dmax = profile.get("date_max")
+            try:
+                if dmin and dmax:
+                    start = pd.to_datetime(dmin).to_pydatetime()
+                    end   = pd.to_datetime(dmax).to_pydatetime()
+                    if start >= end:
+                        end = start + pd.Timedelta(days=365)
+                    return _faker.date_time_between(start_date=start, end_date=end).strftime(fmt)
+            except Exception:
+                pass
+            return fn().strftime(fmt)
         if faker_fn == "date":
-            fmt = profile.get("date_fmt", "%Y-%m-%d")
-            return fn(pattern=fmt)
+            return fn(pattern=profile.get("date_fmt", "%Y-%m-%d"))
         if faker_fn == "date_time_this_decade":
             return str(fn())
         if faker_fn == "bothify":
-            return fn(text="??###")
+            tmpl = profile.get("pattern_template", "??###")
+            return fn(text=tmpl)
         if faker_fn == "boolean":
-            return fn()
+            true_ratio = profile.get("true_ratio", 0.5)
+            return _random.random() < true_ratio
         if faker_fn == "zipcode":
             return fn()
         return fn()
@@ -804,17 +885,36 @@ def generate_fake_dataframe(columns: list[str], faker_map: dict[str, str],
             else:
                 values.append(_generate_typed_value(fn, profile))
 
-        # Cast to original dtype where possible
+        # ── Cast generated values back to original dtype ─────────────────────
         dtype_str = profile.get("dtype_str", "")
         try:
-            if "int" in dtype_str and not profile.get("nullable"):
-                values = pd.array(values, dtype=dtype_str)
+            if "int" in dtype_str:
+                if profile.get("nullable"):
+                    values = pd.array(
+                        [int(v) if v is not None else pd.NA for v in values],
+                        dtype=pd.Int64Dtype()
+                    )
+                else:
+                    values = [int(v) if v is not None else 0 for v in values]
+                    values = pd.array(values, dtype=dtype_str)
             elif "float" in dtype_str:
+                dp     = profile.get("decimal_places", 2)
+                values = [round(float(v), dp) if v is not None else None for v in values]
                 values = pd.array(values, dtype=dtype_str)
             elif "bool" in dtype_str:
                 values = [bool(v) if v is not None else None for v in values]
             elif "datetime" in dtype_str:
+                # datetime generator returns datetime objects — convert correctly
                 values = pd.to_datetime(values, errors="coerce")
+                if profile.get("time_always_zero"):
+                    values = values.normalize()  # strip time component
+            elif profile.get("is_date_str"):
+                # Ensure date strings stay as strings, not converted to datetime
+                fmt    = profile.get("date_fmt", "%Y-%m-%d")
+                values = [str(v) if v is not None else None for v in values]
+            elif profile.get("is_numeric_str") or profile.get("is_pattern_str"):
+                # Keep as strings
+                values = [str(v) if v is not None else None for v in values]
         except Exception:
             pass
         data[col] = values
