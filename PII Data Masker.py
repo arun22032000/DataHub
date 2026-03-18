@@ -131,7 +131,7 @@ if not st.session_state.get("authenticated", False):
 
 st.set_page_config(page_title="IntelliClone", layout="wide")
 st.title("🛡️ IntelliClone")
-st.markdown("Connect to a data source, auto-detect PII columns with AI, review, then mask or clone with demo data.")
+st.markdown("Connect to a data source, auto-detect PII columns with Ollama, review, then mask or clone with demo data.")
 
 # ─── Regex patterns ───────────────────────────────────────────────────────────
 
@@ -338,6 +338,14 @@ def _safe_float_range(mn_f, mx_f):
 def _generate_typed_value(faker_fn: str, profile: dict):
     """Generate a single value respecting the column profile."""
 
+    # ── Pattern template encoded directly in faker_fn (e.g. "__pattern__POL-####") ──
+    if faker_fn and faker_fn.startswith("__pattern__"):
+        template = faker_fn[len("__pattern__"):]
+        try:
+            return _faker.bothify(text=template)
+        except Exception:
+            return _faker.bothify(text="??-####")
+
     # Nullable: randomly inject None
     if profile.get("nullable") and profile.get("null_rate", 0) > 0:
         import random
@@ -510,10 +518,133 @@ def ai_map_faker_columns(columns: list[str], ai_engine: str,
                 if fn != "__passthrough__" and not hasattr(_faker, fn):
                     fn = guess_faker_type(col)
                 mapped[col] = fn
-            return mapped
+            return _apply_column_overrides(mapped, col_samples)
     except Exception:
         pass
-    return {col: guess_faker_type(col) for col in columns}
+    return _apply_column_overrides(
+        {col: guess_faker_type(col) for col in columns}, col_samples
+    )
+
+
+# ── Address family — these should NEVER be used for non-address columns ────────
+_ADDRESS_METHODS = {
+    "address", "street_address", "secondary_address",
+    "city", "state_abbr", "state", "zipcode", "postcode", "country",
+}
+
+# ── Column-name keyword → forced faker_fn overrides ───────────────────────────
+# Keys are lowercase substrings; first match wins.
+_COL_NAME_OVERRIDES = [
+    # Date / time
+    (["_date", "date_", "effective", "expir", "start_dt", "end_dt",
+      "birth_dt", "created_at", "updated_at", "issued", "inception",
+      "_dt", "datetime", "timestamp"], "date_this_decade"),
+    # Policy / reference numbers with common prefixes
+    (["policy_num", "policy_no", "pol_num", "pol_no",
+      "policy_id", "pol_id", "polnum", "polno"], "bothify"),
+    # Generic reference / invoice / order codes
+    (["ref_num", "ref_no", "refnum", "refno",
+      "invoice_num", "invoice_no", "inv_num", "inv_no",
+      "order_num", "order_no", "ord_num",
+      "claim_num", "claim_no",
+      "ticket_num", "ticket_no",
+      "case_num", "case_no",
+      "contract_num", "contract_no",
+      "account_num", "account_no",
+      "member_num", "member_no",
+      "cert_num", "cert_no",
+      "txn_id", "transaction_id", "trans_id",
+      "batch_num", "batch_no",
+      "_code", "_ref", "_num", "_no"], "bothify"),
+    # Pure numeric ID columns
+    (["_id", "id_"], "random_int"),
+]
+
+def _sample_looks_like_date(samples: list) -> bool:
+    """Return True if most non-empty samples parse as a date."""
+    import re as _re
+    DATE_PATTERNS = [
+        r"^\d{4}-\d{2}-\d{2}",          # 2025-01-04
+        r"^\d{2}/\d{2}/\d{4}",          # 01/04/2025
+        r"^\d{2}-\d{2}-\d{4}",          # 04-01-2025
+        r"^\d{4}/\d{2}/\d{2}",          # 2025/01/04
+        r"^\d{1,2}-[A-Za-z]{3}-\d{4}",  # 4-Jan-2025
+    ]
+    hits = 0
+    clean = [str(s).strip() for s in samples if s and str(s).strip() not in ("", "nan", "None")]
+    if not clean:
+        return False
+    for s in clean:
+        if any(_re.match(p, s) for p in DATE_PATTERNS):
+            hits += 1
+    return hits / len(clean) >= 0.6
+
+def _sample_looks_like_pattern(samples: list) -> tuple[bool, str]:
+    """Return (True, template) if samples share a coded-value shape."""
+    import re as _re
+    clean = [str(s).strip() for s in samples if s and str(s).strip() not in ("", "nan", "None")]
+    if len(clean) < 2:
+        return False, ""
+    def to_shape(s):
+        s = _re.sub(r"[A-Za-z]+", "A", s)
+        s = _re.sub(r"[0-9]+", "N", s)
+        return s
+    shapes = [to_shape(s) for s in clean]
+    top = max(set(shapes), key=shapes.count)
+    ratio = shapes.count(top) / len(shapes)
+    if ratio >= 0.6 and _re.search(r"[^AN]", top):
+        # Build bothify template from first matching sample
+        sample = clean[shapes.index(top)]
+        tmpl = _re.sub(r"[A-Za-z]", "?", sample)
+        tmpl = _re.sub(r"[0-9]", "#", tmpl)
+        if ("?" in tmpl or "#" in tmpl) and len(tmpl) <= 30:
+            return True, tmpl
+    return False, ""
+
+def _apply_column_overrides(mapped: dict, col_samples: dict) -> dict:
+    """Post-process AI/keyword mappings with hard overrides based on
+    column name patterns and actual sample value shapes.
+    """
+    result = {}
+    for col, fn in mapped.items():
+        col_lower = col.lower()
+        samples   = col_samples.get(col, [])
+        override  = None
+
+        # ── Layer 1: column-name keyword override ─────────────────────────────
+        for keywords, forced_fn in _COL_NAME_OVERRIDES:
+            if any(kw in col_lower for kw in keywords):
+                override = forced_fn
+                break
+
+        # ── Layer 2: sample value shape override (beats Layer 1 for patterns) ─
+        if samples:
+            if _sample_looks_like_date(samples):
+                override = "date_this_decade"
+            elif override is None or override == "bothify":
+                is_pat, tmpl = _sample_looks_like_pattern(samples)
+                if is_pat:
+                    override = ("__pattern__", tmpl)  # carry template forward
+
+        # ── Layer 3: blacklist bad AI answers for non-address columns ─────────
+        if override is None and fn in _ADDRESS_METHODS:
+            # Only keep address methods if the column name clearly implies address
+            address_keywords = {"address", "addr", "street", "city", "state",
+                                 "zip", "postal", "country", "location", "loc"}
+            if not any(kw in col_lower for kw in address_keywords):
+                # Fall back to keyword guess; if still address, use word
+                fallback = guess_faker_type(col)
+                override = fallback if fallback not in _ADDRESS_METHODS else "word"
+
+        # Apply override
+        if override is None:
+            result[col] = fn
+        elif isinstance(override, tuple) and override[0] == "__pattern__":
+            result[col] = f"__pattern__{override[1]}"   # encode template in fn string
+        else:
+            result[col] = override
+
+    return result
 
 # ─── Entity consistency groups ────────────────────────────────────────────────
 # Faker methods that derive from a shared "person" entity per row.
