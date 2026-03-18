@@ -16,27 +16,75 @@ from snowflake.connector import connect
 
 
 # ─── Auth configuration ───────────────────────────────────────────────────────
-# Add or remove users here. Passwords are SHA-256 hashed.
-# To generate a hash: python -c "import hashlib; print(hashlib.sha256(b'yourpassword').hexdigest())"
+# Users are loaded from st.secrets (Streamlit Cloud) or from a local
+# .streamlit/secrets.toml file in the repo.
+#
+# secrets.toml format:
+#
+#   [users.admin]
+#   password = "your_plain_text_password"
+#   role     = "Administrator"
+#
+#   [users.analyst]
+#   password = "analyst_password"
+#   role     = "Data Analyst"
+#
+#   [users.viewer]
+#   password = "viewer_password"
+#   role     = "Viewer"
+#
+# Passwords in secrets.toml are stored as plain text but the file is never
+# committed to the repo — add .streamlit/secrets.toml to .gitignore.
+# On Streamlit Cloud, paste the same content into App Settings → Secrets.
+#
+# Alternatively, store pre-hashed passwords:
+#   [users.admin]
+#   password_hash = "sha256hexdigest..."
+#   role          = "Administrator"
+#
+# Generate a hash: python -c "import hashlib; print(hashlib.sha256(b'pw').hexdigest())"
 
 def _hash(password: str) -> str:
     return hashlib.sha256(password.encode()).hexdigest()
 
-USER_DB = {
-    "admin":   _hash("Ar#9598#Ar"),
-    "analyst": _hash("analyst@2024"),
-    "viewer":  _hash("view#only1"),
-    "p.a.sivakumar": _hash("pas001"),
-    "santhosh.shasthri": _hash("ss001")
-}
+def _load_user_db() -> tuple[dict, dict]:
+    """Load USER_DB and ROLE_LABELS from st.secrets.
+    Falls back to hardcoded defaults if secrets are not configured,
+    so the app still works during local development without a secrets file.
+    """
+    user_db     = {}
+    role_labels = {}
+    try:
+        users_cfg = st.secrets.get("users", {})
+        if not users_cfg:
+            raise KeyError("no [users] section in secrets")
+        for username, cfg in users_cfg.items():
+            uname = username.strip().lower()
+            # Support both pre-hashed and plain-text passwords
+            if "password_hash" in cfg:
+                user_db[uname] = cfg["password_hash"]
+            elif "password" in cfg:
+                user_db[uname] = _hash(cfg["password"])
+            else:
+                continue  # skip entries with no password
+            role_labels[uname] = cfg.get("role", uname.capitalize())
+    except Exception:
+        # Fallback defaults for local dev when no secrets.toml exists
+        # Change or remove these before deploying to production
+        user_db = {
+            "admin":   _hash("admin123"),
+            "analyst": _hash("analyst@2024"),
+            "viewer":  _hash("view#only1"),
+        }
+        role_labels = {
+            "admin":   "Administrator",
+            "analyst": "Data Analyst",
+            "viewer":  "Viewer",
+        }
+    return user_db, role_labels
 
-ROLE_LABELS = {
-    "admin":   "Administrator",
-    "analyst": "Data Analyst",
-    "viewer":  "Viewer",
-    "user":    "User01",
-    "user":    "User02"
-}
+# Load once at startup
+USER_DB, ROLE_LABELS = _load_user_db()
 
 def _check_credentials(username: str, password: str) -> bool:
     expected = USER_DB.get(username.strip().lower())
@@ -51,7 +99,8 @@ def _render_login():
     with mid:
         st.markdown("<br><br>", unsafe_allow_html=True)
         st.image("https://img.icons8.com/fluency/96/dna.png", width=72)
-        st.markdown("## 🛡️ IntelliClone")
+        st.markdown("## 🧬 IntelliClone")
+        st.markdown("##### Intelligent Data Masking & Demo Data Generation")
         st.markdown("###### Please log in to continue")
         st.markdown("<br>", unsafe_allow_html=True)
 
@@ -82,7 +131,7 @@ if not st.session_state.get("authenticated", False):
     st.stop()
 
 st.set_page_config(page_title="IntelliClone", layout="wide")
-st.title("🛡️ IntelliClone")
+st.title("🧬 IntelliClone")
 st.markdown("Connect to a data source, auto-detect PII columns with Ollama, review, then mask or clone with demo data.")
 
 # ─── Regex patterns ───────────────────────────────────────────────────────────
