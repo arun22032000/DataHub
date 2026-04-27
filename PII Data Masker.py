@@ -11,6 +11,8 @@ import hmac
 from urllib.parse import quote_plus
 from faker import Faker
 from faker.providers import internet, person, address, phone_number, company, date_time, bank, misc
+import factory
+from factory import fuzzy as factory_fuzzy
 from sqlalchemy import create_engine, inspect, text
 from snowflake.connector import connect
 
@@ -98,8 +100,9 @@ def _render_login():
     _, mid, _ = st.columns([1.5, 2, 1.5])
     with mid:
         st.markdown("<br><br>", unsafe_allow_html=True)
-        st.image("https://img.icons8.com/fluency/96/shield.png", width=72)
-        st.markdown("## 🛡️ IntelliClone")
+        st.image("https://img.icons8.com/fluency/96/dna.png", width=72)
+        st.markdown("## 🧬 IntelliClone")
+        st.markdown("##### Intelligent Data Masking & Demo Data Generation")
         st.markdown("###### Please log in to continue")
         st.markdown("<br>", unsafe_allow_html=True)
 
@@ -130,7 +133,7 @@ if not st.session_state.get("authenticated", False):
     st.stop()
 
 st.set_page_config(page_title="IntelliClone", layout="wide")
-st.title("🛡️ IntelliClone")
+st.title("🧬 IntelliClone")
 st.markdown("Connect to a data source, auto-detect PII columns with Ollama, review, then mask or clone with demo data.")
 
 # ─── Regex patterns ───────────────────────────────────────────────────────────
@@ -208,732 +211,859 @@ def guess_faker_type(col_name: str) -> str:
     return "__passthrough__"  # signals: infer from dtype/samples at generation time
 
 # ─── Column profile: analyse samples to guide generation ─────────────────────
+#
+# DESIGN: _profile_column() is the single source of truth about a column.
+# Everything downstream — generator selection, dtype casting, range bounds —
+# reads exclusively from the profile dict. No other code inspects raw data.
+# ─────────────────────────────────────────────────────────────────────────────
+
+import datetime as _dt
+import random   as _rnd
 
 def _profile_column(series: pd.Series) -> dict:
-    """Deep-profile a column: dtype, range, date format, decimal precision,
-    pattern template, enum values, string length — all used to generate
-    values that are similar to what is already in the field."""
-    import re as _re
+    """Return a profile dict describing the column's shape, type, and statistics.
 
-    profile = {"nullable": False, "dtype_str": str(series.dtype)}
+    Keys set (where applicable):
+      kind          : "int" | "float" | "bool" | "datetime" | "date_str" |
+                      "numeric_str" | "pattern" | "enum" | "text" | "string"
+      dtype_str     : str(series.dtype)
+      nullable      : bool
+      null_rate     : float 0-1
+      min_val/max_val: numeric bounds (int/float columns and numeric_str)
+      decimal_places: int (float columns)
+      true_ratio    : float (bool columns)
+      date_fmt      : strftime format string
+      date_min/max  : "YYYY-MM-DD" strings (date_str and datetime)
+      time_varies   : bool (datetime — False means midnight-only)
+      pattern_template: bothify template string e.g. "POL-####-######"
+      pattern_prefix: fixed literal prefix e.g. "POL-"
+      enum_values   : list of observed values
+      enum_weights  : list of floats summing to 1.0
+      min_len/max_len: string length bounds
+      sample_values : up to 8 raw sample strings (for Cortex prompts)
+    """
+    profile = {
+        "kind":      "string",
+        "dtype_str": str(series.dtype),
+        "nullable":  False,
+        "null_rate": 0.0,
+    }
+
+    n_total  = len(series)
     non_null = series.dropna()
-    profile["null_rate"] = float(series.isna().mean()) if len(series) > 0 else 0.0
-    profile["nullable"]  = profile["null_rate"] > 0.0
+    n_valid  = len(non_null)
 
-    if len(non_null) == 0:
+    if n_total > 0:
+        profile["null_rate"] = float(series.isna().mean())
+        profile["nullable"]  = profile["null_rate"] > 0.0
+
+    if n_valid == 0:
         return profile
 
+    profile["sample_values"] = non_null.astype(str).head(8).tolist()
     dtype_str = str(series.dtype)
 
-    # ── Numeric dtype ─────────────────────────────────────────────────────────
-    if "int" in dtype_str or "float" in dtype_str:
-        profile["min_val"]  = float(non_null.min())
-        profile["max_val"]  = float(non_null.max())
-        profile["mean_val"] = float(non_null.mean())
-        if "float" in dtype_str:
-            # Capture decimal precision from actual values
-            decimals = non_null.dropna().apply(
-                lambda x: len(str(x).rstrip("0").split(".")[-1]) if "." in str(x) else 0
-            )
-            profile["decimal_places"] = int(decimals.median()) if len(decimals) else 2
+    # ── Integer / Float ───────────────────────────────────────────────────────
+    if "int" in dtype_str:
+        profile["kind"]    = "int"
+        profile["min_val"] = int(non_null.min())
+        profile["max_val"] = int(non_null.max())
         return profile
 
-    # ── Boolean dtype ─────────────────────────────────────────────────────────
+    if "float" in dtype_str:
+        profile["kind"]    = "float"
+        profile["min_val"] = float(non_null.min())
+        profile["max_val"] = float(non_null.max())
+        # Median decimal precision across non-null values
+        dp_series = non_null.apply(
+            lambda x: len(str(round(x, 10)).rstrip("0").split(".")[-1])
+            if "." in str(round(x, 10)) else 0
+        )
+        profile["decimal_places"] = max(0, int(dp_series.median()))
+        return profile
+
+    # ── Boolean ───────────────────────────────────────────────────────────────
     if "bool" in dtype_str:
-        profile["is_bool"]     = True
-        profile["true_ratio"]  = float(non_null.mean())
+        profile["kind"]       = "bool"
+        profile["true_ratio"] = float(non_null.mean())
         return profile
 
-    # ── Datetime dtype ────────────────────────────────────────────────────────
+    # ── Datetime (pandas dtype) ───────────────────────────────────────────────
     if "datetime" in dtype_str:
-        profile["is_datetime"] = True
-        profile["min_val"]     = str(non_null.min())
-        profile["max_val"]     = str(non_null.max())
-        # Detect if time component is always midnight (date-only stored as datetime)
-        if hasattr(non_null.iloc[0], "hour"):
-            profile["time_always_zero"] = bool((non_null.dt.hour == 0).all())
+        profile["kind"]    = "datetime"
+        profile["min_val"] = str(non_null.min())
+        profile["max_val"] = str(non_null.max())
+        try:
+            profile["date_min"] = str(non_null.min().date())
+            profile["date_max"] = str(non_null.max().date())
+        except Exception:
+            pass
+        # Does the time component ever vary?
+        try:
+            profile["time_varies"] = bool((non_null.dt.hour != 0).any() or
+                                          (non_null.dt.minute != 0).any())
+        except Exception:
+            profile["time_varies"] = True
         return profile
 
     # ── String analysis ───────────────────────────────────────────────────────
-    str_vals    = non_null.astype(str)
-    unique_ratio = non_null.nunique() / len(non_null)
-    profile["unique_ratio"] = unique_ratio
-
-    # Profile string lengths
-    lengths = str_vals.str.len()
+    str_vals = non_null.astype(str).str.strip()
+    lengths  = str_vals.str.len()
     profile["min_len"]  = int(lengths.min())
     profile["max_len"]  = int(lengths.max())
     profile["mean_len"] = int(lengths.mean())
+    n_unique            = non_null.nunique()
+    unique_ratio        = n_unique / n_valid
 
-    # ── 1. Date string detection (highest priority — before enum/pattern) ──────
+    # Priority 1 — Date string (check multiple samples, require ≥60% match)
     _DATE_FMTS = [
         "%Y-%m-%d", "%m/%d/%Y", "%d/%m/%Y", "%Y/%m/%d",
         "%d-%m-%Y", "%m-%d-%Y", "%Y-%m-%d %H:%M:%S",
         "%d-%b-%Y", "%b %d, %Y", "%Y%m%d",
     ]
-    # Test multiple samples for robustness (not just first row)
-    date_hits = 0
-    detected_fmt = None
-    for sv in str_vals.head(10).tolist():
+    samples10 = str_vals.head(10).tolist()
+    date_fmt, date_hits = None, 0
+    for sv in samples10:
         for fmt in _DATE_FMTS:
             try:
-                dt = pd.to_datetime(sv, format=fmt)
+                pd.to_datetime(sv, format=fmt)
                 date_hits += 1
-                if detected_fmt is None:
-                    detected_fmt = fmt
-                    # Store actual date range so generated dates stay in-period
-                    try:
-                        parsed = pd.to_datetime(str_vals, format=fmt, errors="coerce").dropna()
-                        if len(parsed):
-                            profile["date_min"] = str(parsed.min().date())
-                            profile["date_max"] = str(parsed.max().date())
-                    except Exception:
-                        pass
+                date_fmt = date_fmt or fmt
                 break
             except Exception:
                 pass
-    if date_hits >= min(3, len(str_vals)):
-        profile["date_fmt"]     = detected_fmt or "%Y-%m-%d"
-        profile["is_date_str"]  = True
-        return profile   # return early — no further checks needed
-
-    # ── 2. Numeric-string detection ───────────────────────────────────────────
-    numeric_vals = pd.to_numeric(str_vals, errors="coerce")
-    if numeric_vals.notna().mean() > 0.8:
-        profile["min_val"]        = float(numeric_vals.min())
-        profile["max_val"]        = float(numeric_vals.max())
-        profile["is_numeric_str"] = True
-        # Preserve leading zeros (e.g. "007", "00123")
-        if str_vals.str.match(r"^0\d").any():
-            profile["leading_zeros"] = True
-            profile["fixed_len"]     = profile["min_len"]
+    if date_hits >= max(2, len(samples10) * 0.6):
+        profile["kind"]     = "date_str"
+        profile["date_fmt"] = date_fmt or "%Y-%m-%d"
+        try:
+            parsed = pd.to_datetime(str_vals, format=date_fmt, errors="coerce").dropna()
+            if len(parsed):
+                profile["date_min"] = str(parsed.min().date())
+                profile["date_max"] = str(parsed.max().date())
+        except Exception:
+            pass
         return profile
 
-    # ── 3. Pattern / coded-ID detection ──────────────────────────────────────
-    #    e.g. "POL-2025-100003", "INV-001", "TXN-ABC-123"
-    #    Strategy: find the fixed prefix, then make a bothify template for the rest.
-    def _to_shape(s):
-        s = _re.sub(r"[A-Za-z]+", "A", s)
-        s = _re.sub(r"[0-9]+",   "N", s)
+    # Priority 2 — Pure numeric string
+    num_coerced = pd.to_numeric(str_vals, errors="coerce")
+    if num_coerced.notna().mean() > 0.85:
+        profile["kind"]    = "numeric_str"
+        profile["min_val"] = float(num_coerced.min())
+        profile["max_val"] = float(num_coerced.max())
+        # Leading zeros (e.g. "007", "00045")
+        if str_vals.str.match(r"^0\d").any():
+            profile["leading_zeros"] = True
+            profile["fixed_len"]     = int(lengths.mode()[0])
+        return profile
+
+    # Priority 3 — Coded / patterned IDs  (e.g. "POL-2025-100003")
+    def _shape(s):
+        import re as _re2
+        s = _re2.sub(r"[A-Za-z]+", "A", s)
+        s = _re2.sub(r"[0-9]+",   "N", s)
         return s
 
-    shapes = str_vals.head(30).apply(_to_shape)
-    top_shape = shapes.value_counts().index[0]
-    shape_ratio = shapes.value_counts().iloc[0] / len(shapes)
+    shapes     = str_vals.head(40).apply(_shape)
+    top_shape  = shapes.value_counts().index[0]
+    top_ratio  = shapes.value_counts().iloc[0] / len(shapes)
 
-    if shape_ratio >= 0.65 and _re.search(r"[^AN]", top_shape):
-        # Find the longest common prefix across samples (the fixed literal part)
-        samples_list = str_vals.head(30).tolist()
-        prefix = samples_list[0]
-        for sv in samples_list[1:]:
-            while not sv.startswith(prefix) and prefix:
+    if top_ratio >= 0.65 and re.search(r"[^AN]", top_shape):
+        samples40 = str_vals.head(40).tolist()
+        # Longest common prefix = fixed literal part
+        prefix = samples40[0]
+        for sv in samples40[1:]:
+            while prefix and not sv.startswith(prefix):
                 prefix = prefix[:-1]
-        # Build bothify template: keep prefix literal, replace only the variable part
-        suffix_example = samples_list[0][len(prefix):]
-        tmpl_suffix    = _re.sub(r"[A-Za-z]", "?", suffix_example)
-        tmpl_suffix    = _re.sub(r"[0-9]",    "#", tmpl_suffix)
-        full_template  = prefix + tmpl_suffix
-        if ("#" in tmpl_suffix or "?" in tmpl_suffix) and len(full_template) <= 40:
-            profile["is_pattern_str"]  = True
-            profile["pattern_template"] = full_template
+        suffix_ex  = samples40[0][len(prefix):]
+        tmpl_sfx   = re.sub(r"[A-Za-z]", "?", suffix_ex)
+        tmpl_sfx   = re.sub(r"[0-9]",    "#", tmpl_sfx)
+        full_tmpl  = prefix + tmpl_sfx
+        if ("#" in tmpl_sfx or "?" in tmpl_sfx) and 2 <= len(full_tmpl) <= 50:
+            profile["kind"]             = "pattern"
+            profile["pattern_template"] = full_tmpl
             profile["pattern_prefix"]   = prefix
             return profile
 
-    # ── 4. Enum / categorical ─────────────────────────────────────────────────
-    if non_null.nunique() <= 20 and unique_ratio <= 0.6:
+    # Priority 4 — Enum / categorical  (≤25 distinct values, ≤70% unique ratio)
+    if n_unique <= 25 and unique_ratio <= 0.70:
         vc = non_null.value_counts(normalize=True)
+        profile["kind"]         = "enum"
         profile["enum_values"]  = vc.index.tolist()
-        profile["enum_weights"] = vc.values.tolist()  # preserve original distribution
+        profile["enum_weights"] = [float(w) for w in vc.values.tolist()]
         return profile
 
-    # ── 5. Free text / long string ────────────────────────────────────────────
-    # Sample a few values to detect if it's sentence-like
-    sample_texts = str_vals.head(5).tolist()
-    avg_words = sum(len(str(t).split()) for t in sample_texts) / max(len(sample_texts), 1)
-    if avg_words > 4:
-        profile["is_text"] = True
+    # Priority 5 — Free text (avg > 5 words)
+    avg_words = sum(len(s.split()) for s in samples10) / max(len(samples10), 1)
+    if avg_words > 5:
+        profile["kind"] = "text"
+        return profile
 
+    # Default — generic string
+    profile["kind"] = "string"
     return profile
 
-# ─── Safe numeric range helpers ──────────────────────────────────────────────
+
+# ─── Safe numeric ranges ──────────────────────────────────────────────────────
 
 def _safe_int_range(mn, mx):
-    """Return (min, max) guaranteed to satisfy min < max for random_int."""
     mn, mx = int(mn), int(mx)
-    if mn >= mx:
-        mx = mn + 1
-    return mn, mx
+    return mn, max(mn + 1, mx)
 
 def _safe_float_range(mn_f, mx_f):
-    """Return (min, max) guaranteed to satisfy min < max for pyfloat."""
     mn_f, mx_f = float(mn_f), float(mx_f)
-    if mn_f >= mx_f:
-        mx_f = mn_f + 1.0
-    return mn_f, mx_f
+    return mn_f, max(mn_f + 1.0, mx_f)
 
-# ─── Smart value generator ────────────────────────────────────────────────────
 
-def _generate_typed_value(faker_fn: str, profile: dict):
-    """Generate a single value that closely matches the original column's data shape."""
-    import random as _random
+# ─── factory_boy entity factories ────────────────────────────────────────────
 
-    # ── Pattern template encoded in faker_fn by override system ───────────────
-    if faker_fn and faker_fn.startswith("__pattern__"):
-        template = faker_fn[len("__pattern__"):]
-        try:
-            return _faker.bothify(text=template)
-        except Exception:
-            return _faker.bothify(text="??-####")
+class _PersonFactory(factory.Factory):
+    """All person fields derived from the same first+last name seed."""
+    class Meta:
+        model = dict
 
-    # ── Nullable injection ────────────────────────────────────────────────────
-    if profile.get("nullable") and profile.get("null_rate", 0) > 0:
-        if _random.random() < profile["null_rate"]:
-            return None
+    first_name   = factory.Faker("first_name")
+    last_name    = factory.Faker("last_name")
+    prefix       = factory.Faker("prefix")
+    suffix       = factory.Faker("suffix")
+    ssn          = factory.Faker("ssn")
+    job          = factory.Faker("job")
+    phone_number = factory.Faker("phone_number")
+    date_of_birth = factory.LazyAttribute(
+        lambda o: _faker.date_of_birth(minimum_age=18, maximum_age=90).strftime("%Y-%m-%d")
+    )
+    name = factory.LazyAttribute(lambda o: f"{o.first_name} {o.last_name}")
+    email = factory.LazyAttribute(lambda o: (
+        re.sub(r"[^a-z]", "", o.first_name.lower()) +
+        _rnd.choice([".", "_"]) +
+        re.sub(r"[^a-z]", "", o.last_name.lower()) +
+        (str(_faker.random_int(1, 99)) if _rnd.random() < 0.4 else "") +
+        "@" + _faker.free_email_domain()
+    ))
+    user_name = factory.LazyAttribute(
+        lambda o: re.sub(r"[^a-z0-9._]", "", o.email.split("@")[0].lower())[:28]
+    )
+    password = factory.LazyAttribute(
+        lambda o: _faker.password(length=12, special_chars=True, digits=True, upper_case=True)
+    )
 
-    dtype_str = profile.get("dtype_str", "")
 
-    # ── Profile-driven overrides — fire BEFORE any AI faker_fn ────────────────
+class _AddressFactory(factory.Factory):
+    """City/state/zip generated together so they are geographically coherent."""
+    class Meta:
+        model = dict
 
-    # Boolean (weighted by original true ratio)
-    if profile.get("is_bool") or "bool" in dtype_str:
-        true_ratio = profile.get("true_ratio", 0.5)
-        return _random.random() < true_ratio
+    street_address    = factory.Faker("street_address")
+    secondary_address = factory.Faker("secondary_address")
+    city              = factory.Faker("city")
+    state_abbr        = factory.Faker("state_abbr")
+    zipcode           = factory.Faker("zipcode")
+    country           = "US"
+    address = factory.LazyAttribute(
+        lambda o: f"{o.street_address}, {o.city}, {o.state_abbr} {o.zipcode}"
+    )
+    postcode = factory.SelfAttribute("zipcode")
+    state    = factory.SelfAttribute("state_abbr")
 
-    # Date string — use actual date range from the data
-    if profile.get("is_date_str"):
-        fmt  = profile.get("date_fmt", "%Y-%m-%d")
-        dmin = profile.get("date_min")
-        dmax = profile.get("date_max")
-        try:
-            if dmin and dmax:
-                start = pd.to_datetime(dmin).to_pydatetime()
-                end   = pd.to_datetime(dmax).to_pydatetime()
-                if start >= end:
-                    end = start + pd.Timedelta(days=365)
-                return _faker.date_time_between(start_date=start, end_date=end).strftime(fmt)
-            return _faker.date_this_decade(before_today=True, after_today=False).strftime(fmt)
-        except Exception:
-            return _faker.date()
 
-    # Datetime dtype — use actual range, preserve time-only or full datetime
-    if profile.get("is_datetime"):
-        try:
-            min_dt = pd.to_datetime(profile.get("min_val"))
-            max_dt = pd.to_datetime(profile.get("max_val"))
-            if min_dt >= max_dt:
-                max_dt = min_dt + pd.Timedelta(days=365)
-            dt = _faker.date_time_between(start_date=min_dt, end_date=max_dt)
-            if profile.get("time_always_zero"):
-                return dt.replace(hour=0, minute=0, second=0)
-            return dt
-        except Exception:
-            return _faker.date_time_this_decade()
+class _CompanyFactory(factory.Factory):
+    class Meta:
+        model = dict
 
-    # Pattern / coded IDs — keep prefix, randomise only variable segments
-    if profile.get("is_pattern_str"):
-        template = profile.get("pattern_template", "??-####")
-        try:
-            return _faker.bothify(text=template)
-        except Exception:
-            return _faker.bothify(text="??-####")
+    company = factory.Faker("company")
+    company_email = factory.LazyAttribute(
+        lambda o: "info@" + re.sub(r"[^a-z0-9]", "", o.company.lower()[:15]) + ".com"
+    )
 
-    # Enum / categorical — sample with original distribution weights
-    if "enum_values" in profile:
-        vals    = profile["enum_values"]
-        weights = profile.get("enum_weights")
-        if weights and len(weights) == len(vals):
-            return _random.choices(vals, weights=weights, k=1)[0]
-        return _random.choice(vals)
 
-    # Numeric dtype — range-aware with correct precision
-    if "int" in dtype_str or "float" in dtype_str:
-        if "float" in dtype_str:
-            mn_f, mx_f = _safe_float_range(profile.get("min_val", 0.0), profile.get("max_val", 99999.0))
-            dp = profile.get("decimal_places", 2)
-            return round(_faker.pyfloat(min_value=mn_f, max_value=mx_f), dp)
-        mn, mx = _safe_int_range(profile.get("min_val", 0), profile.get("max_val", 99999))
-        return _faker.random_int(min=mn, max=mx)
+# ─── fuzzy helpers (factory_boy) ──────────────────────────────────────────────
 
-    # Numeric stored as string — preserve leading zeros and length if detected
-    if profile.get("is_numeric_str"):
-        mn, mx = _safe_int_range(profile.get("min_val", 0), profile.get("max_val", 99999))
-        val = _faker.random_int(min=mn, max=mx)
-        if profile.get("leading_zeros") and profile.get("fixed_len"):
-            return str(val).zfill(profile["fixed_len"])
-        return str(val)
+def _fuzzy_int(mn: int, mx: int) -> int:
+    return factory_fuzzy.FuzzyInteger(mn, mx).fuzz()
 
-    # Free text / sentence
-    if profile.get("is_text"):
-        return _faker.sentence()
+def _fuzzy_float(mn: float, mx: float, dp: int = 2) -> float:
+    return round(factory_fuzzy.FuzzyFloat(mn, mx).fuzz(), dp)
 
-    # Passthrough — pure dtype inference
-    if faker_fn == "__passthrough__":
-        if "int" in dtype_str:
-            mn, mx = _safe_int_range(profile.get("min_val", 0), profile.get("max_val", 99999))
-            return _faker.random_int(min=mn, max=mx)
-        if "float" in dtype_str:
-            mn_f, mx_f = _safe_float_range(profile.get("min_val", 0.0), profile.get("max_val", 99999.0))
-            return round(_faker.pyfloat(min_value=mn_f, max_value=mx_f), profile.get("decimal_places", 2))
-        # String: match original length
-        min_l = profile.get("min_len", 3)
-        max_l = min(profile.get("max_len", 20), 40)
-        return _faker.lexify("?" * _random.randint(min_l, max_l))
-
-    # Named Faker method — with profile-aware arguments
+def _fuzzy_date(start_str: str, end_str: str, fmt: str = "%Y-%m-%d") -> str:
     try:
-        fn = getattr(_faker, faker_fn)
-        if faker_fn == "random_element":
-            # Use enum_values if available, else fallback
-            if "enum_values" in profile:
-                return _random.choice(profile["enum_values"])
-            return fn(elements=["Male", "Female", "Non-binary"])
-        if faker_fn == "random_int":
-            mn, mx = _safe_int_range(profile.get("min_val", 0), profile.get("max_val", 99999))
-            return fn(min=mn, max=mx)
-        if faker_fn == "pyfloat":
-            mn_f, mx_f = _safe_float_range(profile.get("min_val", 0.0), profile.get("max_val", 99999.0))
-            return round(fn(min_value=mn_f, max_value=mx_f), profile.get("decimal_places", 2))
-        if faker_fn == "date_of_birth":
-            # Infer age range from dob range if available
-            return fn(minimum_age=18, maximum_age=90).strftime(profile.get("date_fmt", "%Y-%m-%d"))
-        if faker_fn == "date_this_decade":
-            fmt  = profile.get("date_fmt", "%Y-%m-%d")
-            dmin = profile.get("date_min")
-            dmax = profile.get("date_max")
-            try:
-                if dmin and dmax:
-                    start = pd.to_datetime(dmin).to_pydatetime()
-                    end   = pd.to_datetime(dmax).to_pydatetime()
-                    if start >= end:
-                        end = start + pd.Timedelta(days=365)
-                    return _faker.date_time_between(start_date=start, end_date=end).strftime(fmt)
-            except Exception:
-                pass
-            return fn().strftime(fmt)
-        if faker_fn == "date":
-            return fn(pattern=profile.get("date_fmt", "%Y-%m-%d"))
-        if faker_fn == "date_time_this_decade":
-            return str(fn())
-        if faker_fn == "bothify":
-            tmpl = profile.get("pattern_template", "??###")
-            return fn(text=tmpl)
-        if faker_fn == "boolean":
-            true_ratio = profile.get("true_ratio", 0.5)
-            return _random.random() < true_ratio
-        if faker_fn == "zipcode":
-            return fn()
-        return fn()
+        s = _dt.date.fromisoformat(start_str[:10])
+        e = _dt.date.fromisoformat(end_str[:10])
+        if s >= e:
+            e = s + _dt.timedelta(days=365)
+        return factory_fuzzy.FuzzyDate(s, e).fuzz().strftime(fmt)
     except Exception:
-        return _faker.word()
+        return _faker.date_this_decade().strftime(fmt)
 
-def build_faker_prompt(col_samples: dict) -> str:
-    """Build AI prompt with column names AND sample values for better mapping."""
-    samples_str = json.dumps(col_samples, indent=2, default=str)
-    return f"""You are a data generation assistant. Given column names and sample values from a database table, assign the most appropriate Faker library method for each column.
+def _fuzzy_datetime(start_str: str, end_str: str, time_varies: bool = True):
+    """Return a datetime object within [start, end]."""
+    try:
+        s = pd.to_datetime(start_str).to_pydatetime()
+        e = pd.to_datetime(end_str).to_pydatetime()
+        if s >= e:
+            e = s + _dt.timedelta(days=365)
+        return _faker.date_time_between(start_date=s, end_date=e)
+    except Exception:
+        return _faker.date_time_this_decade()
 
-Available Faker methods: name, first_name, last_name, email, phone_number, ssn, address, street_address, city, state_abbr, zipcode, country, company, user_name, password, ipv4, ipv6, url, date_of_birth, date_this_decade, date_time_this_decade, credit_card_number, iban, bban, text, sentence, uuid4, job, latitude, longitude, random_int, pyfloat, boolean, color_name, currency_code, year, time, suffix, prefix, secondary_address, bothify, word.
+def _fuzzy_choice(vals: list, weights: list = None):
+    if weights and len(weights) == len(vals):
+        return _rnd.choices(vals, weights=weights, k=1)[0]
+    return factory_fuzzy.FuzzyChoice(vals).fuzz()
 
-Rules:
-- Return ONLY a JSON object: keys = column names, values = Faker method names from the list above.
-- No markdown fences, no explanation.
-- Study the sample VALUES carefully — the shape of the value matters more than the column name.
-- Dates (e.g. "2025-01-04", "01/15/2024") → date_this_decade
-- Timestamps (e.g. "2025-01-04 10:30:00") → date_time_this_decade
-- Coded IDs / reference numbers (e.g. "POL-2025-100003", "INV-001", "TXN-ABC-123") → bothify
-- Numeric-only strings (e.g. "100003", "4200") → random_int
-- 2-letter state codes → state_abbr
-- Y/N or True/False flags → boolean
-- Small fixed set of values (status, type, category) → random_element
-- Numeric IDs or primary keys → random_int
-- If sample values contain letters AND digits AND separators (like dashes) forming a code pattern → bothify
-- NEVER return address, street_address, city, state, or zipcode for columns that contain dates, codes, IDs, or numbers.
-- If truly unsure, use word.
 
-Column samples (name: [sample values]):
-{samples_str}
+# ─── Per-kind value generators ────────────────────────────────────────────────
+#
+# generate_value(kind, profile, faker_fn) is the single entry point.
+# It dispatches purely on profile["kind"], making behaviour predictable.
+# faker_fn is only consulted for the "string" kind (semantic Faker methods).
 
-Response (JSON only):"""
+def _gen_int(profile: dict) -> int:
+    mn, mx = _safe_int_range(profile.get("min_val", 0), profile.get("max_val", 99999))
+    return _fuzzy_int(mn, mx)
 
-# ── Address family — these should NEVER be used for non-address columns ────────
-_ADDRESS_METHODS = {
-    "address", "street_address", "secondary_address",
-    "city", "state_abbr", "state", "zipcode", "postcode", "country",
+def _gen_float(profile: dict) -> float:
+    mn, mx = _safe_float_range(profile.get("min_val", 0.0), profile.get("max_val", 99999.0))
+    dp     = profile.get("decimal_places", 2)
+    return _fuzzy_float(mn, mx, dp)
+
+def _gen_bool(profile: dict) -> bool:
+    return _rnd.random() < profile.get("true_ratio", 0.5)
+
+def _gen_datetime(profile: dict):
+    dmin = profile.get("min_val") or profile.get("date_min", "2015-01-01")
+    dmax = profile.get("max_val") or profile.get("date_max", "2025-12-31")
+    dt   = _fuzzy_datetime(str(dmin), str(dmax), profile.get("time_varies", True))
+    if not profile.get("time_varies", True):
+        dt = dt.replace(hour=0, minute=0, second=0, microsecond=0)
+    return dt
+
+def _gen_date_str(profile: dict) -> str:
+    fmt  = profile.get("date_fmt", "%Y-%m-%d")
+    dmin = profile.get("date_min", "2015-01-01")
+    dmax = profile.get("date_max", "2025-12-31")
+    return _fuzzy_date(dmin, dmax, fmt)
+
+def _gen_numeric_str(profile: dict) -> str:
+    mn, mx = _safe_int_range(profile.get("min_val", 0), profile.get("max_val", 99999))
+    val    = _fuzzy_int(mn, mx)
+    if profile.get("leading_zeros") and profile.get("fixed_len"):
+        return str(val).zfill(profile["fixed_len"])
+    return str(val)
+
+def _gen_pattern(profile: dict) -> str:
+    tmpl = profile.get("pattern_template", "??-####")
+    try:
+        return _faker.bothify(text=tmpl)
+    except Exception:
+        return _faker.bothify(text="??-####")
+
+def _gen_enum(profile: dict):
+    return _fuzzy_choice(profile["enum_values"], profile.get("enum_weights"))
+
+def _gen_text(_profile: dict) -> str:
+    return _faker.sentence(nb_words=_rnd.randint(6, 14))
+
+# Semantic Faker method dispatcher — used only for "string" kind
+_SEMANTIC_MAP = {
+    "first_name":          lambda p: None,    # handled by entity factory
+    "last_name":           lambda p: None,
+    "name":                lambda p: None,
+    "email":               lambda p: None,
+    "user_name":           lambda p: None,
+    "phone_number":        lambda p: _faker.phone_number(),
+    "ssn":                 lambda p: _faker.ssn(),
+    "address":             lambda p: None,    # handled by entity factory
+    "street_address":      lambda p: None,
+    "city":                lambda p: None,
+    "state_abbr":          lambda p: None,
+    "zipcode":             lambda p: None,
+    "country":             lambda p: None,
+    "company":             lambda p: None,    # handled by entity factory
+    "job":                 lambda p: _faker.job(),
+    "uuid4":               lambda p: str(_faker.uuid4()),
+    "ipv4":                lambda p: _faker.ipv4(),
+    "ipv6":                lambda p: _faker.ipv6(),
+    "url":                 lambda p: _faker.url(),
+    "credit_card_number":  lambda p: _faker.credit_card_number(),
+    "iban":                lambda p: _faker.iban(),
+    "bban":                lambda p: _faker.bban(),
+    "currency_code":       lambda p: _faker.currency_code(),
+    "color_name":          lambda p: _faker.color_name(),
+    "latitude":            lambda p: str(_faker.latitude()),
+    "longitude":           lambda p: str(_faker.longitude()),
+    "sentence":            lambda p: _faker.sentence(),
+    "text":                lambda p: _faker.text(max_nb_chars=200),
+    "paragraph":           lambda p: _faker.paragraph(),
+    "word":                lambda p: _faker.word(),
+    "password":            lambda p: _faker.password(length=12, special_chars=True),
+    "prefix":              lambda p: _faker.prefix(),
+    "suffix":              lambda p: _faker.suffix(),
+    "year":                lambda p: str(_faker.year()),
+    "time":                lambda p: _faker.time(),
+    "locale":              lambda p: _faker.locale(),
 }
 
-# ── Column-name keyword → forced faker_fn overrides ───────────────────────────
-# Keys are lowercase substrings; first match wins.
-_COL_NAME_OVERRIDES = [
-    # Date / time
-    (["_date", "date_", "effective", "expir", "start_dt", "end_dt",
-      "birth_dt", "created_at", "updated_at", "issued", "inception",
-      "_dt", "datetime", "timestamp"], "date_this_decade"),
-    # Policy / reference numbers with common prefixes
-    (["policy_number","policy_num", "policy_no", "pol_num", "pol_no",
-      "policy_id", "pol_id", "polnum", "polno"], "bothify"),
-    # Generic reference / invoice / order codes
-    (["ref_num", "ref_no", "refnum", "refno",
-      "invoice_num", "invoice_no", "inv_num", "inv_no",
-      "order_num", "order_no", "ord_num",
-      "claim_num", "claim_no",
-      "ticket_num", "ticket_no",
-      "case_num", "case_no",
-      "contract_num", "contract_no",
-      "account_num", "account_no",
-      "member_num", "member_no",
-      "cert_num", "cert_no",
-      "txn_id", "transaction_id", "trans_id",
-      "batch_num", "batch_no",
-      "_code", "_ref", "_num", "_no"], "bothify"),
-    # Pure numeric ID columns
-    (["_id", "id_"], "random_int"),
+def _gen_string(profile: dict, faker_fn: str) -> str:
+    """Generate a string value using the semantic Faker method."""
+    if faker_fn.startswith("__pattern__"):
+        return _faker.bothify(text=faker_fn[len("__pattern__"):])
+
+    handler = _SEMANTIC_MAP.get(faker_fn)
+    if handler is not None:
+        result = handler(profile)
+        if result is not None:
+            return str(result)
+
+    # Try calling Faker directly as a fallback
+    try:
+        fn_callable = getattr(_faker, faker_fn, None)
+        if fn_callable:
+            return str(fn_callable())
+    except Exception:
+        pass
+
+    # Last resort — generate something length-appropriate
+    min_l = profile.get("min_len", 4)
+    max_l = min(profile.get("max_len", 20), 40)
+    return _faker.lexify("?" * _rnd.randint(min_l, max_l))
+
+
+def _generate_one(kind: str, profile: dict, faker_fn: str):
+    """Dispatch to the correct per-kind generator. Returns a raw Python value."""
+    if kind == "int":          return _gen_int(profile)
+    if kind == "float":        return _gen_float(profile)
+    if kind == "bool":         return _gen_bool(profile)
+    if kind == "datetime":     return _gen_datetime(profile)
+    if kind == "date_str":     return _gen_date_str(profile)
+    if kind == "numeric_str":  return _gen_numeric_str(profile)
+    if kind == "pattern":      return _gen_pattern(profile)
+    if kind == "enum":         return _gen_enum(profile)
+    if kind == "text":         return _gen_text(profile)
+    return _gen_string(profile, faker_fn)  # "string" — semantic Faker method
+
+
+# ─── Column classification ────────────────────────────────────────────────────
+
+# Which Faker methods belong to which entity factory
+_PERSON_FNS  = {"first_name","last_name","name","prefix","suffix",
+                "email","user_name","password","phone_number",
+                "date_of_birth","ssn","job"}
+_ADDRESS_FNS = {"address","street_address","secondary_address",
+                "city","state_abbr","state","zipcode","postcode","country"}
+_COMPANY_FNS = {"company","company_email"}
+
+# Factory field lookup
+_PERSON_FIELDS = {
+    "first_name":"first_name","last_name":"last_name","name":"name",
+    "prefix":"prefix","suffix":"suffix","email":"email",
+    "user_name":"user_name","password":"password",
+    "phone_number":"phone_number","date_of_birth":"date_of_birth",
+    "ssn":"ssn","job":"job",
+}
+_ADDRESS_FIELDS = {
+    "address":"address","street_address":"street_address",
+    "secondary_address":"secondary_address","city":"city",
+    "state_abbr":"state_abbr","state":"state",
+    "zipcode":"zipcode","postcode":"postcode","country":"country",
+}
+
+# Methods Cortex handles better than rule-based generation
+_CORTEX_FNS  = {"word","sentence","text","paragraph"}
+# Methods always handled by rule-based generation (never use Cortex)
+_CORTEX_SKIP = (
+    _PERSON_FNS | _ADDRESS_FNS | _COMPANY_FNS |
+    {"random_int","pyfloat","boolean","uuid4","credit_card_number",
+     "iban","bban","ipv4","ipv6","url","zipcode","state_abbr",
+     "latitude","longitude","currency_code","color_name","job",
+     "__passthrough__"}
+)
+
+
+# ─── AI column-name → faker_fn mapper ────────────────────────────────────────
+#
+# This is the ONLY place AI/keywords map a column name to a faker_fn.
+# The profile's "kind" always wins at generation time — so even if the mapper
+# returns "address" for EFFECTIVE_DATE, _profile_column will have set
+# kind="date_str" and the date generator fires, ignoring the faker_fn.
+
+_COL_KEYWORD_RULES: list[tuple[list[str], str]] = [
+    # Person
+    (["first_name","fname","given_name"],        "first_name"),
+    (["last_name","lname","surname","family"],    "last_name"),
+    (["full_name","customer_name","holder_name",
+      "insured_name","member_name","_name"],      "name"),
+    (["email","e_mail","mail"],                   "email"),
+    (["phone","mobile","cell","tel"],             "phone_number"),
+    (["username","user_name","login"],            "user_name"),
+    (["password","passwd","pwd"],                 "password"),
+    (["ssn","sin","national_id","tax_id"],        "ssn"),
+    (["dob","birth_date","date_of_birth"],        "date_of_birth"),
+    (["job","title","occupation","position"],     "job"),
+    # Address
+    (["street","address_line","addr_line"],       "street_address"),
+    (["address","addr"],                          "address"),
+    (["city","town","municipality"],              "city"),
+    (["state","province","region"],               "state_abbr"),
+    (["zip","postal","postcode"],                 "zipcode"),
+    (["country","nation"],                        "country"),
+    # Company
+    (["company","employer","organization","org"], "company"),
+    # Dates — any column with date-like words maps to date_this_decade
+    # (profile "kind" will override to date_str/datetime if samples confirm)
+    (["_date","date_","effective","expir","start_dt","end_dt",
+      "inception","issued","_dt","timestamp","created","updated",
+      "modified","processed","received"],         "date_this_decade"),
+    # Codes / IDs
+    (["policy_num","pol_num","policy_no","pol_no",
+      "policy_id","pol_id"],                      "bothify"),
+    (["ref_num","ref_no","refnum","invoice_num",
+      "invoice_no","claim_num","claim_no",
+      "order_num","order_no","cert_num","cert_no",
+      "batch_num","txn_id","transaction_id",
+      "_code","_ref","_num","_no"],               "bothify"),
+    (["_id","id_","identifier"],                  "random_int"),
+    # Numeric
+    (["amount","premium","price","cost","salary",
+      "balance","payment","total","rate","fee"],  "pyfloat"),
+    (["count","qty","quantity","num_"],            "random_int"),
+    (["latitude","lat_"],                         "latitude"),
+    (["longitude","lon_","lng_"],                 "longitude"),
+    # Other
+    (["uuid","guid"],                             "uuid4"),
+    (["ip_address","ip_addr"],                    "ipv4"),
+    (["url","website","link"],                    "url"),
+    (["credit_card","cc_num"],                    "credit_card_number"),
+    (["iban"],                                    "iban"),
+    (["currency"],                                "currency_code"),
+    (["color","colour"],                          "color_name"),
+    (["description","notes","comment","remarks",
+      "summary","detail","narrative"],            "sentence"),
+    (["status","type","category","class",
+      "gender","flag","indicator"],               "random_element"),
 ]
 
-def _sample_looks_like_date(samples: list) -> bool:
-    """Return True if most non-empty samples parse as a date."""
-    import re as _re
-    DATE_PATTERNS = [
-        r"^\d{4}-\d{2}-\d{2}",          # 2025-01-04
-        r"^\d{2}/\d{2}/\d{4}",          # 01/04/2025
-        r"^\d{2}-\d{2}-\d{4}",          # 04-01-2025
-        r"^\d{4}/\d{2}/\d{2}",          # 2025/01/04
-        r"^\d{1,2}-[A-Za-z]{3}-\d{4}",  # 4-Jan-2025
-    ]
-    hits = 0
-    clean = [str(s).strip() for s in samples if s and str(s).strip() not in ("", "nan", "None")]
-    if not clean:
-        return False
-    for s in clean:
-        if any(_re.match(p, s) for p in DATE_PATTERNS):
-            hits += 1
-    return hits / len(clean) >= 0.6
+def _map_col_by_name(col: str) -> str | None:
+    """Return a faker_fn based on column name keywords, or None if no match."""
+    col_l = col.lower()
+    for keywords, fn in _COL_KEYWORD_RULES:
+        if any(kw in col_l for kw in keywords):
+            return fn
+    return None
 
-def _sample_looks_like_pattern(samples: list) -> tuple[bool, str]:
-    """Return (True, template) if samples share a coded-value shape."""
-    import re as _re
-    clean = [str(s).strip() for s in samples if s and str(s).strip() not in ("", "nan", "None")]
-    if len(clean) < 2:
-        return False, ""
-    def to_shape(s):
-        s = _re.sub(r"[A-Za-z]+", "A", s)
-        s = _re.sub(r"[0-9]+", "N", s)
-        return s
-    shapes = [to_shape(s) for s in clean]
-    top = max(set(shapes), key=shapes.count)
-    ratio = shapes.count(top) / len(shapes)
-    if ratio >= 0.6 and _re.search(r"[^AN]", top):
-        # Build bothify template from first matching sample
-        sample = clean[shapes.index(top)]
-        tmpl = _re.sub(r"[A-Za-z]", "?", sample)
-        tmpl = _re.sub(r"[0-9]", "#", tmpl)
-        if ("?" in tmpl or "#" in tmpl) and len(tmpl) <= 30:
-            return True, tmpl
-    return False, ""
 
-def _apply_column_overrides(mapped: dict, col_samples: dict) -> dict:
-    """Post-process AI/keyword mappings with hard overrides.
+def ai_map_faker_columns(
+    columns: list[str],
+    ai_engine: str,
+    df_sample: pd.DataFrame = None,
+    ollama_url=None, ollama_model=None, ollama_timeout=180,
+    sf_conn=None, cortex_model=None,
+) -> dict[str, str]:
+    """Map each column to a faker_fn.
 
-    Priority (highest wins):
-      1. Sample value shape — if values look like dates or coded patterns,
-         always use the correct method regardless of AI output or column name.
-      2. Column name keywords — explicit keyword→method rules.
-      3. Address blacklist — AI returned an address-family method for a
-         non-address column; replace with a safe fallback.
+    Strategy:
+      1. Try AI (Ollama or Cortex) with column name + sample values.
+      2. For any column the AI maps poorly (returns an address method for
+         a non-address column), fall back to keyword rules.
+      3. Profile "kind" always wins at generation time — so even a bad
+         mapping is harmless for date/numeric/pattern/enum columns.
     """
-    _ADDRESS_WORDS = {"address", "addr", "street", "city", "state",
-                      "zip", "postal", "country", "location", "loc"}
-
-    result = {}
-    for col, fn in mapped.items():
-        col_lower = col.lower()
-        samples   = [s for s in col_samples.get(col, [])
-                     if s and str(s).strip() not in ("", "nan", "None", "NaT")]
-        override  = None
-
-        # ── Layer 1 (HIGHEST): sample value shape — beats AI and column name ───
-        # This fires first so that actual data always beats AI guesses.
-        if samples:
-            if _sample_looks_like_date(samples):
-                override = "date_this_decade"
-            else:
-                is_pat, tmpl = _sample_looks_like_pattern(samples)
-                if is_pat:
-                    override = ("__pattern__", tmpl)
-
-        # ── Layer 2: column-name keyword override ─────────────────────────────
-        # Only applies when Layer 1 didn't already set a definitive override.
-        if override is None:
-            for keywords, forced_fn in _COL_NAME_OVERRIDES:
-                if any(kw in col_lower for kw in keywords):
-                    override = forced_fn
-                    break
-
-        # ── Layer 3: address blacklist ─────────────────────────────────────────
-        # If AI returned an address-family method for a non-address column,
-        # replace it. This catches everything that slipped through layers 1 & 2.
-        if override is None and fn in _ADDRESS_METHODS:
-            if not any(kw in col_lower for kw in _ADDRESS_WORDS):
-                # Try keyword guess first; if that also gives address, use "word"
-                fallback = guess_faker_type(col)
-                override = fallback if fallback not in _ADDRESS_METHODS else "word"
-
-        # ── Apply ──────────────────────────────────────────────────────────────
-        if override is None:
-            result[col] = fn
-        elif isinstance(override, tuple) and override[0] == "__pattern__":
-            result[col] = f"__pattern__{override[1]}"
-        else:
-            result[col] = override
-
-    return result
-
-
-def ai_map_faker_columns(columns: list[str], ai_engine: str,
-                          df_sample: pd.DataFrame = None,
-                          ollama_url=None, ollama_model=None, ollama_timeout=180,
-                          sf_conn=None, cortex_model=None) -> dict[str, str]:
-    """Map column names to Faker methods using AI + sample values. Falls back to keyword matching."""
-    # Build sample dict for the prompt
-    col_samples = {}
+    # Build sample dict for the AI prompt
+    col_samples: dict[str, list] = {}
     if df_sample is not None and not df_sample.empty:
         for col in columns:
-            col_samples[col] = df_sample[col].dropna().astype(str).head(5).tolist()
+            col_samples[col] = df_sample[col].dropna().astype(str).head(6).tolist()
     else:
         col_samples = {col: [] for col in columns}
 
-    prompt = build_faker_prompt(col_samples)
-    raw = ""
+    _ADDRESS_METHODS = {"address","street_address","secondary_address",
+                        "city","state_abbr","state","zipcode","postcode","country"}
+    _ADDR_COL_WORDS  = {"address","addr","street","city","state","zip",
+                        "postal","country","location","loc"}
+
+    ai_result: dict[str, str] = {}
+    prompt = _build_mapping_prompt(col_samples)
+
     try:
+        raw = ""
         if ai_engine == "Ollama (LLaMA)" and ollama_url and ollama_model:
             resp = requests.post(
                 f"{ollama_url.rstrip('/')}/api/chat",
                 json={
-                    "model": ollama_model,
+                    "model":    ollama_model,
                     "messages": [{"role": "user", "content": prompt}],
-                    "stream": False,
-                    "options": {"temperature": 0, "num_predict": 1024},
+                    "stream":   False,
+                    "options":  {"temperature": 0, "num_predict": 1024},
                 },
                 timeout=ollama_timeout,
             )
             resp.raise_for_status()
             raw = resp.json()["message"]["content"].strip()
+
         elif ai_engine == "Snowflake Cortex" and sf_conn and cortex_model:
             cur = sf_conn.cursor()
-            escaped = prompt.replace("'", "\'")
+            escaped = prompt.replace("'", "\\'")
             cur.execute(f"SELECT SNOWFLAKE.CORTEX.COMPLETE('{cortex_model}', '{escaped}')")
             row = cur.fetchone()
             raw = (row[0] if row else "").strip()
 
-        raw = re.sub(r"^```(?:json)?|```$", "", raw, flags=re.MULTILINE).strip()
-        result = json.loads(raw)
-        if isinstance(result, dict):
-            mapped = {}
-            for col in columns:
-                fn = result.get(col, guess_faker_type(col))
-                if fn != "__passthrough__" and not hasattr(_faker, fn):
-                    fn = guess_faker_type(col)
-                mapped[col] = fn
-            return _apply_column_overrides(mapped, col_samples)
+        if raw:
+            raw = re.sub(r"^```(?:json)?|```$", "", raw, flags=re.MULTILINE).strip()
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                ai_result = parsed
     except Exception:
         pass
-    return _apply_column_overrides(
-        {col: guess_faker_type(col) for col in columns}, col_samples
-    )
 
-
-
-# ─── Entity consistency groups ────────────────────────────────────────────────
-# Faker methods that derive from a shared "person" entity per row.
-# When multiple columns belong to the same group, they are generated together
-# from one Faker profile so names, emails, usernames etc. all match.
-
-_ENTITY_GROUPS = {
-    # Person group — all derive from the same first/last name seed
-    "person": {
-        "first_name", "last_name", "name", "prefix", "suffix",
-        "email", "user_name", "password", "phone_number",
-        "date_of_birth", "ssn", "job",
-    },
-    # Address group — city/state/zip are coherent within a locale
-    "address": {
-        "address", "street_address", "secondary_address",
-        "city", "state_abbr", "state", "zipcode", "postcode", "country",
-    },
-    # Company group — company name + domain stay paired
-    "company": {
-        "company",
-    },
-}
-
-# Reverse map: faker_fn → group name
-_FN_TO_GROUP: dict[str, str] = {}
-for _grp, _fns in _ENTITY_GROUPS.items():
-    for _fn in _fns:
-        _FN_TO_GROUP[_fn] = _grp
-
-
-class _PersonEntity:
-    """Holds one coherent person record generated by Faker."""
-    __slots__ = ("first", "last", "prefix", "suffix", "full_name",
-                 "email", "username", "password",
-                 "phone", "dob", "ssn", "job")
-
-    def __init__(self):
-        self.first     = _faker.first_name()
-        self.last      = _faker.last_name()
-        self.prefix    = _faker.prefix()
-        self.suffix    = _faker.suffix()
-        self.full_name = f"{self.first} {self.last}"
-        # Email and username derived from actual name → they match
-        _clean_first   = re.sub(r"[^a-z]", "", self.first.lower())
-        _clean_last    = re.sub(r"[^a-z]", "", self.last.lower())
-        _domain        = _faker.free_email_domain()
-        _sep           = _faker.random_element([".", "_", ""])
-        _num           = str(_faker.random_int(min=1, max=999)) if _faker.boolean(chance_of_getting_true=40) else ""
-        self.username  = f"{_clean_first}{_sep}{_clean_last}{_num}"[:30]
-        self.email     = f"{_clean_first}{_sep}{_clean_last}{_num}@{_domain}"
-        self.password  = _faker.password(length=12, special_chars=True, digits=True, upper_case=True)
-        self.phone     = _faker.phone_number()
-        self.dob       = _faker.date_of_birth(minimum_age=18, maximum_age=90).strftime("%Y-%m-%d")
-        self.ssn       = _faker.ssn()
-        self.job       = _faker.job()
-
-
-class _AddressEntity:
-    """Holds one coherent address record (city/state/zip stay together)."""
-    __slots__ = ("full_address", "street", "secondary",
-                 "city", "state", "zipcode", "country")
-
-    def __init__(self):
-        self.street    = _faker.street_address()
-        self.secondary = _faker.secondary_address()
-        self.city      = _faker.city()
-        self.state     = _faker.state_abbr()
-        self.zipcode   = _faker.zipcode()
-        self.country   = "US"
-        self.full_address = f"{self.street}, {self.city}, {self.state} {self.zipcode}"
-
-
-def _resolve_entity_value(entity, faker_fn: str):
-    """Pull the right field from a pre-built entity given the column's faker_fn."""
-    if isinstance(entity, _PersonEntity):
-        return {
-            "first_name":    entity.first,
-            "last_name":     entity.last,
-            "name":          entity.full_name,
-            "prefix":        entity.prefix,
-            "suffix":        entity.suffix,
-            "email":         entity.email,
-            "user_name":     entity.username,
-            "password":      entity.password,
-            "phone_number":  entity.phone,
-            "date_of_birth": entity.dob,
-            "ssn":           entity.ssn,
-            "job":           entity.job,
-        }.get(faker_fn, entity.full_name)
-    if isinstance(entity, _AddressEntity):
-        return {
-            "address":          entity.full_address,
-            "street_address":   entity.street,
-            "secondary_address":entity.secondary,
-            "city":             entity.city,
-            "state_abbr":       entity.state,
-            "state":            entity.state,
-            "zipcode":          entity.zipcode,
-            "postcode":         entity.zipcode,
-            "country":          entity.country,
-        }.get(faker_fn, entity.full_address)
-    return None
-
-
-def _classify_columns(faker_map: dict[str, str]) -> dict[str, str]:
-    """Return {col_name: group_name} for all columns that belong to an entity group."""
-    return {col: _FN_TO_GROUP[fn] for col, fn in faker_map.items() if fn in _FN_TO_GROUP}
-
-
-def generate_fake_dataframe(columns: list[str], faker_map: dict[str, str],
-                              df_original: pd.DataFrame, n_rows: int) -> pd.DataFrame:
-    """Generate n_rows of realistic fake data with entity consistency.
-
-    Columns that share a semantic entity (person, address) are generated together
-    per row so that names, emails, usernames, and addresses are internally coherent.
-    All other columns are generated independently as before.
-    """
-    import random
-
-    # Build per-column profiles from original data
-    profiles = {}
+    # Build final mapping: AI result + address-blacklist fix + keyword fallback
+    final: dict[str, str] = {}
     for col in columns:
-        if df_original is not None and col in df_original.columns and not df_original[col].dropna().empty:
+        fn = ai_result.get(col, "")
+
+        # Validate AI returned a known Faker method
+        if fn and fn not in {"__passthrough__"} and not hasattr(_faker, fn):
+            fn = ""
+
+        # Reject address methods for non-address columns
+        if fn in _ADDRESS_METHODS:
+            col_l = col.lower()
+            if not any(kw in col_l for kw in _ADDR_COL_WORDS):
+                fn = ""   # force keyword/passthrough fallback
+
+        # Keyword rule fallback
+        if not fn:
+            fn = _map_col_by_name(col) or "__passthrough__"
+
+        final[col] = fn
+
+    return final
+
+
+def _build_mapping_prompt(col_samples: dict) -> str:
+    samples_str = json.dumps(col_samples, indent=2, default=str)
+    return f"""You are a data generation assistant.
+Given column names and sample values from a database table, assign the best Faker method for generating realistic fake data.
+
+Available methods: name, first_name, last_name, email, phone_number, ssn, address, street_address, city, state_abbr, zipcode, country, company, user_name, password, ipv4, ipv6, url, date_of_birth, date_this_decade, date_time_this_decade, credit_card_number, iban, bban, sentence, uuid4, job, latitude, longitude, random_int, pyfloat, boolean, color_name, currency_code, bothify, word.
+
+Rules (strictly follow these — they override your own judgment):
+- Look at sample VALUES more than column names.
+- Date-shaped values (e.g. "2025-01-04", "01/15/2024") → date_this_decade
+- Timestamp values (e.g. "2025-01-04 10:30:00") → date_time_this_decade
+- Coded IDs with letters+digits+separators (e.g. "POL-2025-100003") → bothify
+- Pure numeric strings → random_int
+- 2-letter codes that look like US states → state_abbr
+- Columns with only a few distinct values (status, type, category) → word (not address, city, or state)
+- Numeric columns for money/amounts → pyfloat
+- NEVER assign address/city/state/zipcode/country to a column unless its name clearly contains "address", "city", "state", "zip", or "country".
+- Return ONLY a JSON object. No markdown, no explanation.
+
+Columns:
+{samples_str}
+
+Response (JSON only):"""
+
+
+# ─── Cortex AI value generator ────────────────────────────────────────────────
+
+def _cortex_generate_col(col_name: str, samples: list[str], n: int,
+                          sf_conn, model: str) -> list[str] | None:
+    """Generate n values for a column using Cortex AI in batches of 50."""
+    if not sf_conn or not model or not samples:
+        return None
+    BATCH  = 50
+    result = []
+    samp_s = json.dumps(samples[:6])
+    try:
+        cur = sf_conn.cursor()
+        while len(result) < n:
+            b = min(BATCH, n - len(result))
+            prompt = (
+                f"Generate exactly {b} realistic fake values for a database "
+                f"column called '{col_name}'. "
+                f"Sample real values: {samp_s}. "
+                f"Match format, vocabulary, and length of samples exactly. "
+                f"Return ONLY a JSON array of {b} strings. No markdown."
+            )
+            cur.execute(
+                f"SELECT SNOWFLAKE.CORTEX.COMPLETE('{model}', "
+                f"'{prompt.replace(chr(39), chr(39)+chr(39))}') "
+            )
+            row = cur.fetchone()
+            if not row:
+                break
+            raw = re.sub(r"^```(?:json)?|```$", "", row[0].strip(), flags=re.MULTILINE).strip()
+            m   = re.search(r"\[.*?\]", raw, re.DOTALL)
+            if not m:
+                break
+            batch = json.loads(m.group())
+            if not isinstance(batch, list) or not batch:
+                break
+            result.extend(str(v) for v in batch)
+        if not result:
+            return None
+        while len(result) < n:
+            result.extend(result[: n - len(result)])
+        return result[:n]
+    except Exception:
+        return None
+
+
+# ─── Main generation function ─────────────────────────────────────────────────
+
+def generate_fake_dataframe(
+    columns:     list[str],
+    faker_map:   dict[str, str],
+    df_original: pd.DataFrame,
+    n_rows:      int,
+    sf_conn=None,
+    cortex_model: str = None,
+) -> pd.DataFrame:
+    """Generate n_rows of demo data column by column.
+
+    For each column the pipeline is:
+      1. Profile the original data  → profile["kind"] drives everything.
+      2. If kind is handled by profile (date/int/float/bool/enum/pattern/numeric_str)
+         → use the appropriate fuzzy/Faker generator directly.
+      3. If kind is "string" and faker_fn is a person/address/company field
+         → pull from the corresponding factory_boy entity (entity-consistent).
+      4. If kind is "string" and Cortex AI is available and faker_fn is in
+         _CORTEX_FNS  → use Cortex for domain vocabulary.
+      5. Otherwise → _gen_string(profile, faker_fn) via _SEMANTIC_MAP.
+
+    Values are cast back to the original dtype after generation.
+    """
+
+    # ── Build profiles ────────────────────────────────────────────────────────
+    profiles: dict[str, dict] = {}
+    for col in columns:
+        if (df_original is not None
+                and col in df_original.columns
+                and not df_original[col].dropna().empty):
             profiles[col] = _profile_column(df_original[col])
         else:
-            profiles[col] = {"dtype_str": "object", "nullable": False, "null_rate": 0.0}
+            profiles[col] = {"kind":"string","dtype_str":"object",
+                             "nullable":False,"null_rate":0.0}
 
-    # Determine which columns participate in entity groups
-    col_groups = _classify_columns(faker_map)
+    # ── Detect which entity factories are needed ──────────────────────────────
+    need_person  = any(faker_map.get(c,"") in _PERSON_FNS  for c in columns)
+    need_address = any(faker_map.get(c,"") in _ADDRESS_FNS for c in columns)
+    need_company = any(faker_map.get(c,"") in _COMPANY_FNS for c in columns)
 
-    # Pre-generate one entity object per row for each group that appears
-    has_person  = any(g == "person"  for g in col_groups.values())
-    has_address = any(g == "address" for g in col_groups.values())
+    person_rows  = [_PersonFactory()  for _ in range(n_rows)] if need_person  else []
+    address_rows = [_AddressFactory() for _ in range(n_rows)] if need_address else []
+    company_rows = [_CompanyFactory() for _ in range(n_rows)] if need_company else []
 
-    person_entities  = [_PersonEntity()  for _ in range(n_rows)] if has_person  else []
-    address_entities = [_AddressEntity() for _ in range(n_rows)] if has_address else []
+    # ── Pre-generate Cortex columns ───────────────────────────────────────────
+    cortex_data: dict[str, list] = {}
+    if sf_conn and cortex_model:
+        for col in columns:
+            fn      = faker_map.get(col, "__passthrough__")
+            profile = profiles[col]
+            if profile["kind"] != "string":
+                continue   # profile handles it — no Cortex needed
+            if fn not in _CORTEX_FNS:
+                continue
+            if fn in _CORTEX_SKIP:
+                continue
+            samples = profile.get("sample_values", [])
+            if not samples:
+                continue
+            generated = _cortex_generate_col(col, samples, n_rows, sf_conn, cortex_model)
+            if generated:
+                cortex_data[col] = generated
 
-    data = {}
+    # ── Generate each column ──────────────────────────────────────────────────
+    data: dict[str, list] = {}
+
     for col in columns:
         fn      = faker_map.get(col, "__passthrough__")
         profile = profiles[col]
-        group   = col_groups.get(col)
+        kind    = profile["kind"]
+        nullable  = profile.get("nullable", False)
+        null_rate = profile.get("null_rate", 0.0)
 
-        values = []
-        for i in range(n_rows):
+        values: list = []
+        for row_i in range(n_rows):
             # Nullable injection
-            if profile.get("nullable") and profile.get("null_rate", 0) > 0:
-                if random.random() < profile["null_rate"]:
-                    values.append(None)
-                    continue
+            if nullable and null_rate > 0 and _rnd.random() < null_rate:
+                values.append(None)
+                continue
 
-            if group == "person" and person_entities:
-                values.append(_resolve_entity_value(person_entities[i], fn))
-            elif group == "address" and address_entities:
-                values.append(_resolve_entity_value(address_entities[i], fn))
+            # ── Cortex AI ────────────────────────────────────────────────────
+            if col in cortex_data:
+                values.append(cortex_data[col][row_i])
+                continue
+
+            # ── Profile-driven generators (kind always wins) ──────────────────
+            if kind == "int":
+                values.append(_gen_int(profile))
+            elif kind == "float":
+                values.append(_gen_float(profile))
+            elif kind == "bool":
+                values.append(_gen_bool(profile))
+            elif kind == "datetime":
+                values.append(_gen_datetime(profile))
+            elif kind == "date_str":
+                values.append(_gen_date_str(profile))
+            elif kind == "numeric_str":
+                values.append(_gen_numeric_str(profile))
+            elif kind == "pattern":
+                values.append(_gen_pattern(profile))
+            elif kind == "enum":
+                values.append(_gen_enum(profile))
+            elif kind == "text":
+                values.append(_gen_text(profile))
+
+            # ── Entity factory (string kind, semantic fn) ────────────────────
+            elif fn in _PERSON_FNS and person_rows:
+                field = _PERSON_FIELDS.get(fn, "name")
+                values.append(person_rows[row_i].get(field, person_rows[row_i]["name"]))
+
+            elif fn in _ADDRESS_FNS and address_rows:
+                field = _ADDRESS_FIELDS.get(fn, "address")
+                values.append(address_rows[row_i].get(field, address_rows[row_i]["address"]))
+
+            elif fn in _COMPANY_FNS and company_rows:
+                field = "company" if fn == "company" else "company_email"
+                values.append(company_rows[row_i].get(field, company_rows[row_i]["company"]))
+
+            # ── Semantic Faker / passthrough ─────────────────────────────────
             else:
-                values.append(_generate_typed_value(fn, profile))
+                values.append(_gen_string(profile, fn))
 
-        # ── Cast generated values back to original dtype ─────────────────────
+        # ── Cast to original dtype ────────────────────────────────────────────
         dtype_str = profile.get("dtype_str", "")
         try:
-            if "int" in dtype_str:
-                if profile.get("nullable"):
+            if kind == "int" or "int" in dtype_str:
+                if nullable:
                     values = pd.array(
                         [int(v) if v is not None else pd.NA for v in values],
-                        dtype=pd.Int64Dtype()
+                        dtype=pd.Int64Dtype(),
                     )
                 else:
-                    values = [int(v) if v is not None else 0 for v in values]
-                    values = pd.array(values, dtype=dtype_str)
-            elif "float" in dtype_str:
+                    values = pd.array(
+                        [int(v) if v is not None else 0 for v in values],
+                        dtype=dtype_str if "int" in dtype_str else "int64",
+                    )
+            elif kind == "float" or "float" in dtype_str:
                 dp     = profile.get("decimal_places", 2)
                 values = [round(float(v), dp) if v is not None else None for v in values]
-                values = pd.array(values, dtype=dtype_str)
-            elif "bool" in dtype_str:
+                values = pd.array(values, dtype=dtype_str if "float" in dtype_str else "float64")
+            elif kind == "bool" or "bool" in dtype_str:
                 values = [bool(v) if v is not None else None for v in values]
-            elif "datetime" in dtype_str:
-                # datetime generator returns datetime objects — convert correctly
+            elif kind == "datetime" or "datetime" in dtype_str:
                 values = pd.to_datetime(values, errors="coerce")
-                if profile.get("time_always_zero"):
-                    values = values.normalize()  # strip time component
-            elif profile.get("is_date_str"):
-                # Ensure date strings stay as strings, not converted to datetime
-                fmt    = profile.get("date_fmt", "%Y-%m-%d")
-                values = [str(v) if v is not None else None for v in values]
-            elif profile.get("is_numeric_str") or profile.get("is_pattern_str"):
-                # Keep as strings
+                if not profile.get("time_varies", True):
+                    values = values.normalize()
+            elif kind in ("date_str", "numeric_str", "pattern"):
                 values = [str(v) if v is not None else None for v in values]
         except Exception:
+            # If cast fails, leave as list of Python objects — Pandas will infer
             pass
+
         data[col] = values
 
     return pd.DataFrame(data)
+
 
 # ─── Ollama ───────────────────────────────────────────────────────────────────
 
@@ -1775,6 +1905,17 @@ if st.session_state.faker_mapped and st.session_state.faker_maps:
         st.session_state.faker_dfs = {}
         gen_prog = st.progress(0, text="Generating...")
         tables_list = st.session_state.selected_tables
+
+        # Resolve Cortex connection for generation (reuse data source conn if Snowflake)
+        _gen_sf_conn    = None
+        _gen_cortex_mdl = None
+        if ai_engine == "Snowflake Cortex":
+            _gen_cortex_mdl = cortex_model
+            if st.session_state.connection and st.session_state.connection[0] == "snowflake":
+                _gen_sf_conn = st.session_state.connection[1]
+            elif st.session_state.get("cortex_conn"):
+                _gen_sf_conn = st.session_state["cortex_conn"]
+
         for i, table in enumerate(tables_list):
             gen_prog.progress(i / len(tables_list), text=f"Generating `{table}`...")
             df_t   = st.session_state.table_dfs.get(table, pd.DataFrame())
@@ -1782,7 +1923,10 @@ if st.session_state.faker_mapped and st.session_state.faker_maps:
             n_rows = st.session_state.fake_row_overrides.get(table, len(df_t))
             if not fmap:
                 continue
-            fake_df = generate_fake_dataframe(list(df_t.columns), fmap, df_t, int(n_rows))
+            fake_df = generate_fake_dataframe(
+                list(df_t.columns), fmap, df_t, int(n_rows),
+                sf_conn=_gen_sf_conn, cortex_model=_gen_cortex_mdl,
+            )
             if fake_mode == "Append demo rows to existing data" and not df_t.empty:
                 result_df = pd.concat([df_t, fake_df], ignore_index=True)
             else:
