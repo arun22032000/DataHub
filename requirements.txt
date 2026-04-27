@@ -5,4 +5,4 @@ pyodbc
 Faker
 sqlalchemy
 snowflake-connector-python
-factory
+factory-boy
